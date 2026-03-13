@@ -1,5 +1,9 @@
-from .logger_worker import LoggerWorker
-from .psu_worker import PsuWorker
-from .vesc_worker import VescWorker
+from .vesc_worker import vesc_worker_main
+from .psu_worker import psu_worker_main
+from .logger_worker import logger_worker_main
 
-__all__ = ["LoggerWorker", "PsuWorker", "VescWorker"]
+__all__ = [
+    "vesc_worker_main",
+    "psu_worker_main",
+    "logger_worker_main",
+]
