@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from controller import CycleFSM
-from controller import interp_profile
+from controller.cycle_fsm import CycleFSM
+from controller.pump_profile import interp_profile
 from scheme.cycle import CycleInputs, CycleTargets, State, Transition
 from scheme.pump_profile import PumpProfile
 from scheme.startup import StartupConfig
