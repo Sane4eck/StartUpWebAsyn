@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import queue
 import threading
 import time
 from dataclasses import asdict
@@ -9,8 +11,8 @@ from typing import Any, Callable
 from openpyxl import load_workbook
 from serial.tools import list_ports
 
-from controller.runtime_types import PsuTarget, VescTarget
-from controller.workers import LoggerWorker, PsuWorker, VescWorker
+from controller.runtime_types import PsuSnapshot, PsuTarget, VescSnapshot, VescTarget, make_command
+from controller.workers import logger_worker_main, psu_worker_main, vesc_worker_main
 from scheme.startup import StartupConfig
 
 
@@ -60,9 +62,56 @@ def _load_profile_xlsx(path: str) -> tuple[list[float], list[float]]:
         raise ValueError("Pump profile XLSX must contain at least two numeric columns: time, rpm")
 
     points.sort(key=lambda x: x[0])
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return xs, ys
+    return [p[0] for p in points], [p[1] for p in points]
+
+
+class _ProcHandle:
+    def __init__(self, ctx: mp.context.BaseContext, name: str, target, args: tuple[Any, ...]):
+        self.ctx = ctx
+        self.name = name
+        self.target = target
+        self.args = args
+
+        self.cmd_q = ctx.Queue()
+        self.evt_q = ctx.Queue()
+        self.stop_evt = ctx.Event()
+        self.proc: mp.Process | None = None
+
+    def start(self) -> None:
+        if self.proc is not None and self.proc.is_alive():
+            return
+        self.stop_evt.clear()
+        self.proc = self.ctx.Process(
+            target=self.target,
+            args=(self.name, self.cmd_q, self.evt_q, self.stop_evt, *self.args),
+            name=f"{self.name}-proc",
+            daemon=True,
+        )
+        self.proc.start()
+
+    def stop(self) -> None:
+        self.stop_evt.set()
+        try:
+            self.cmd_q.put_nowait({"kind": "__stop__", "payload": {}})
+        except Exception:
+            pass
+        if self.proc is not None and self.proc.is_alive():
+            self.proc.join(timeout=2.0)
+        if self.proc is not None and self.proc.is_alive():
+            self.proc.terminate()
+            self.proc.join(timeout=1.0)
+
+    def post(self, msg: dict[str, Any]) -> None:
+        self.cmd_q.put(msg)
+
+    def drain_events(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        while True:
+            try:
+                out.append(self.evt_q.get_nowait())
+            except queue.Empty:
+                break
+        return out
 
 
 class WebControllerRuntime:
@@ -76,6 +125,7 @@ class WebControllerRuntime:
         self.dt = float(dt)
         self.ui_hz = 5.0
         self.log_hz = 5.0
+        self.stale_worker_s = 1.0
 
         self._ui_dt = 1.0 / self.ui_hz
         self._log_dt = 1.0 / self.log_hz
@@ -84,16 +134,11 @@ class WebControllerRuntime:
         self._stop_evt = threading.Event()
         self._thread: threading.Thread | None = None
 
-        self._pump = VescWorker("pump-worker", period_s=0.02, read_timeout_s=0.01)
-        self._starter = VescWorker("starter-worker", period_s=0.02, read_timeout_s=0.01)
-        self._psu = PsuWorker(
-            "psu-worker",
-            period_s=0.02,
-            read_period_s=0.5,
-            cmd_period_s=0.2,
-            timeout_s=0.2,
-        )
-        self._logger = LoggerWorker()
+        self._ctx = mp.get_context("spawn")
+        self._pump_proc = _ProcHandle(self._ctx, "pump", vesc_worker_main, (0.02, 0.01, 115200))
+        self._starter_proc = _ProcHandle(self._ctx, "starter", vesc_worker_main, (0.02, 0.01, 115200))
+        self._psu_proc = _ProcHandle(self._ctx, "psu", psu_worker_main, (0.02, 0.5, 0.2, 115200, 0.2, 1))
+        self._logger_proc = _ProcHandle(self._ctx, "logger", logger_worker_main, ("logs",))
 
         self._cfg = StartupConfig()
 
@@ -104,6 +149,11 @@ class WebControllerRuntime:
 
         self._stage = "idle"
         self._last_error = ""
+        self._logger_path = ""
+
+        self._pump_snap = VescSnapshot()
+        self._starter_snap = VescSnapshot()
+        self._psu_snap = PsuSnapshot()
 
         self._pump_manual = VescTarget(mode="rpm", value=0.0)
         self._starter_manual = VescTarget(mode="duty", value=0.0)
@@ -123,17 +173,17 @@ class WebControllerRuntime:
         self._valve_macro_t0 = 0.0
 
         self._holds: dict[str, float] = {}
+        self._seq = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
 
         self._stop_evt.clear()
-
-        self._pump.start()
-        self._starter.start()
-        self._psu.start()
-        self._logger.start()
+        self._pump_proc.start()
+        self._starter_proc.start()
+        self._psu_proc.start()
+        self._logger_proc.start()
 
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -148,10 +198,12 @@ class WebControllerRuntime:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
-        self._pump.stop()
-        self._starter.stop()
-        self._psu.stop()
-        self._logger.stop()
+        self._safe_zero_outputs()
+
+        self._pump_proc.stop()
+        self._starter_proc.stop()
+        self._psu_proc.stop()
+        self._logger_proc.stop()
 
     def list_ports(self) -> list[str]:
         items = []
@@ -168,40 +220,45 @@ class WebControllerRuntime:
             "last_error": self._last_error,
         }
 
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _post(self, proc: _ProcHandle, worker: str, kind: str, payload: dict[str, Any]) -> None:
+        proc.post(make_command(worker=worker, kind=kind, payload=payload, seq=self._next_seq()))
+
     def cmd_connect_pump(self, port: str) -> None:
         port = str(port or "").strip()
         if not port:
             raise ValueError("Pump COM port is empty")
-        self._pump.connect(port)
+        self._post(self._pump_proc, "pump", "connect", {"port": port})
 
     def cmd_disconnect_pump(self) -> None:
-        self._pump.disconnect()
+        self._post(self._pump_proc, "pump", "disconnect", {})
 
     def cmd_connect_starter(self, port: str) -> None:
         port = str(port or "").strip()
         if not port:
             raise ValueError("Starter COM port is empty")
-        self._starter.connect(port)
+        self._post(self._starter_proc, "starter", "connect", {"port": port})
 
     def cmd_disconnect_starter(self) -> None:
-        self._starter.disconnect()
+        self._post(self._starter_proc, "starter", "disconnect", {})
 
     def cmd_connect_psu(self, port: str) -> None:
         port = str(port or "").strip()
         if not port:
             raise ValueError("PSU COM port is empty")
-        self._psu.connect(port)
+        self._post(self._psu_proc, "psu", "connect", {"port": port})
 
     def cmd_disconnect_psu(self) -> None:
-        self._psu.disconnect()
+        self._post(self._psu_proc, "psu", "disconnect", {})
 
     def cmd_set_pole_pairs_pump(self, pole_pairs: int) -> None:
-        pp = max(1, int(pole_pairs))
-        self._pump.set_pole_pairs(pp)
+        self._post(self._pump_proc, "pump", "set_pole_pairs", {"pole_pairs": max(1, int(pole_pairs))})
 
     def cmd_set_pole_pairs_starter(self, pole_pairs: int) -> None:
-        pp = max(1, int(pole_pairs))
-        self._starter.set_pole_pairs(pp)
+        self._post(self._starter_proc, "starter", "set_pole_pairs", {"pole_pairs": max(1, int(pole_pairs))})
 
     def cmd_ready(self, prefix: str = "manual") -> None:
         now = time.monotonic()
@@ -214,7 +271,7 @@ class WebControllerRuntime:
             self._stage_t0 = now
             self._session_t0 = now
             self._last_error = ""
-        self._logger.open_log(prefix or "manual")
+        self._post(self._logger_proc, "logger", "open", {"prefix": prefix or "manual"})
         self._publish("status", {**self._build_status(), "ready": True})
 
     def cmd_update_reset(self) -> None:
@@ -376,9 +433,7 @@ class WebControllerRuntime:
                 next_tick = now + self.dt
 
     def _tick(self, now: float) -> None:
-        pump_snap = self._pump.snapshot()
-        starter_snap = self._starter.snapshot()
-        psu_snap = self._psu.snapshot()
+        self._drain_worker_events()
 
         with self._lock:
             pump_target = VescTarget(self._pump_manual.mode, self._pump_manual.value)
@@ -398,7 +453,7 @@ class WebControllerRuntime:
                         self._stage_t0 = now
 
             if self._startup_active:
-                self._tick_startup_locked(now, pump_snap, starter_snap, psu_snap)
+                self._tick_startup_locked(now)
                 pump_target = VescTarget(self._pump_manual.mode, self._pump_manual.value)
                 starter_target = VescTarget(self._starter_manual.mode, self._starter_manual.value)
 
@@ -426,9 +481,11 @@ class WebControllerRuntime:
                         out=True,
                     )
 
-        self._pump.set_target(pump_target.mode, pump_target.value)
-        self._starter.set_target(starter_target.mode, starter_target.value)
-        self._psu.set_target(psu_target.v, psu_target.i, psu_target.out)
+        self._post(self._pump_proc, "pump", "set_target", {"mode": pump_target.mode, "value": pump_target.value})
+        self._post(self._starter_proc, "starter", "set_target", {"mode": starter_target.mode, "value": starter_target.value})
+        self._post(self._psu_proc, "psu", "set_target", {"v": psu_target.v, "i": psu_target.i, "out": psu_target.out})
+
+        self._check_stale(now)
 
         if (now - self._last_ui) >= self._ui_dt:
             self._last_ui = now
@@ -437,20 +494,55 @@ class WebControllerRuntime:
 
         if (now - self._last_log) >= self._log_dt:
             self._last_log = now
-            self._logger.write_row(self._build_log_row())
+            self._post(self._logger_proc, "logger", "row", self._build_log_row())
 
-    def _tick_startup_locked(self, now: float, pump_snap, starter_snap, psu_snap) -> None:
+    def _drain_worker_events(self) -> None:
+        for proc in (self._pump_proc, self._starter_proc, self._psu_proc, self._logger_proc):
+            for evt in proc.drain_events():
+                worker = str(evt.get("worker", ""))
+                kind = str(evt.get("kind", ""))
+                payload = evt.get("payload", {}) or {}
+
+                if worker == "pump" and kind == "snapshot":
+                    self._pump_snap = VescSnapshot(**payload)
+                elif worker == "starter" and kind == "snapshot":
+                    self._starter_snap = VescSnapshot(**payload)
+                elif worker == "psu" and kind == "snapshot":
+                    self._psu_snap = PsuSnapshot(**payload)
+                elif worker == "logger" and kind == "state":
+                    self._logger_path = str(payload.get("log_path", "") or "")
+                    err = payload.get("error")
+                    if err:
+                        self._last_error = str(err)
+                        self._publish("error", self._last_error)
+
+                if kind == "error":
+                    msg = str(payload.get("message", "worker error"))
+                    self._last_error = f"{worker}: {msg}"
+                    self._publish("error", self._last_error)
+
+    def _check_stale(self, now: float) -> None:
+        snaps = [self._pump_snap, self._starter_snap]
+        for snap in snaps:
+            if snap.connected and (now - snap.ts) > self.stale_worker_s:
+                self._fault_locked(now, "Worker stale timeout")
+                return
+
+    def _tick_startup_locked(self, now: float) -> None:
         cfg = self._cfg
         stage = self._stage
         stage_dt = now - self._stage_t0
 
+        starter_rpm = float(self._starter_snap.rpm_mech)
+        pump_rpm = float(self._pump_snap.rpm_mech)
+
         if stage == "starter":
-            duty = self._starter_step_duty(float(starter_snap.rpm_mech))
+            duty = self._starter_step_duty(starter_rpm)
             self._starter_manual = VescTarget(mode="duty", value=duty)
 
             if self._hold_true_locked(
                 "to_fuelramp",
-                float(starter_snap.rpm_mech) >= cfg.to_fuelramp_starter_rpm,
+                starter_rpm >= cfg.to_fuelramp_starter_rpm,
                 now,
                 cfg.to_fuelramp_hold_s,
             ):
@@ -466,12 +558,12 @@ class WebControllerRuntime:
                 return
 
         elif stage == "fuelramp":
-            duty = self._starter_step_duty(float(starter_snap.rpm_mech))
+            duty = self._starter_step_duty(starter_rpm)
             self._starter_manual = VescTarget(mode="duty", value=duty)
 
             if self._hold_true_locked(
                 "valve_close",
-                float(starter_snap.rpm_mech) >= cfg.valve_close_rpm,
+                starter_rpm >= cfg.valve_close_rpm,
                 now,
                 cfg.valve_close_hold_s,
             ):
@@ -479,7 +571,7 @@ class WebControllerRuntime:
 
             if self._hold_true_locked(
                 "starter_off",
-                float(starter_snap.rpm_mech) >= cfg.starter_off_rpm,
+                starter_rpm >= cfg.starter_off_rpm,
                 now,
                 cfg.starter_off_hold_s,
             ):
@@ -487,7 +579,7 @@ class WebControllerRuntime:
 
             if self._hold_true_locked(
                 "to_running",
-                float(starter_snap.rpm_mech) >= cfg.to_running_starter_rpm,
+                starter_rpm >= cfg.to_running_starter_rpm,
                 now,
                 cfg.to_running_hold_s,
             ):
@@ -497,7 +589,7 @@ class WebControllerRuntime:
                 self._holds.clear()
                 self._valve_macro_active = False
                 self._starter_manual = VescTarget(mode="duty", value=0.0)
-                self._pump_manual = VescTarget(mode="rpm", value=float(pump_snap.rpm_mech))
+                self._pump_manual = VescTarget(mode="rpm", value=pump_rpm)
                 return
 
             if stage_dt >= cfg.fuelramp_timeout_s:
@@ -550,19 +642,24 @@ class WebControllerRuntime:
 
         self._holds.clear()
 
-    def _build_status(self) -> dict[str, Any]:
-        pump = self._pump.snapshot()
-        starter = self._starter.snapshot()
-        psu = self._psu.snapshot()
+    def _safe_zero_outputs(self) -> None:
+        try:
+            self._post(self._pump_proc, "pump", "set_target", {"mode": "rpm", "value": 0.0})
+            self._post(self._starter_proc, "starter", "set_target", {"mode": "duty", "value": 0.0})
+            self._post(self._psu_proc, "psu", "set_target", {"v": self._psu_manual.v, "i": self._psu_manual.i, "out": False})
+            time.sleep(0.1)
+        except Exception:
+            pass
 
+    def _build_status(self) -> dict[str, Any]:
         return {
             "stage": self._stage,
             "connected": {
-                "pump": pump.connected,
-                "starter": starter.connected,
-                "psu": psu.connected,
+                "pump": self._pump_snap.connected,
+                "starter": self._starter_snap.connected,
+                "psu": self._psu_snap.connected,
             },
-            "log_path": self._logger.log_path,
+            "log_path": self._logger_path,
             "pump_profile": {
                 "active": self._pump_profile_active,
                 "path": self._pump_profile_path,
@@ -573,21 +670,17 @@ class WebControllerRuntime:
         }
 
     def _build_sample(self) -> dict[str, Any]:
-        pump = self._pump.snapshot()
-        starter = self._starter.snapshot()
-        psu = self._psu.snapshot()
-
         return {
             "t": max(0.0, time.monotonic() - self._session_t0),
             "stage": self._stage,
             "connected": {
-                "pump": pump.connected,
-                "starter": starter.connected,
-                "psu": psu.connected,
+                "pump": self._pump_snap.connected,
+                "starter": self._starter_snap.connected,
+                "psu": self._psu_snap.connected,
             },
-            "pump": asdict(pump),
-            "starter": asdict(starter),
-            "psu": asdict(psu),
+            "pump": asdict(self._pump_snap),
+            "starter": asdict(self._starter_snap),
+            "psu": asdict(self._psu_snap),
         }
 
     def _build_log_row(self) -> dict[str, Any]:
