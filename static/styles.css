@@ -1,0 +1,285 @@
+:root {
+  --bg: #06080c;
+  --panel: #0f1319;
+  --panel-2: #141a22;
+  --border: #2b3340;
+  --text: #edf2f8;
+  --muted: #a2adbc;
+  --accent: #2d6cdf;
+  --accent-2: #1b4ea9;
+  --danger: #7e2020;
+  --danger-border: #a63333;
+  --input: #0b0f14;
+  --hover: #1a2130;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-size: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  padding: 8px;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: calc(100vh - 16px);
+}
+
+.plot-panel,
+.manual-panel,
+.status-bar {
+  background: linear-gradient(180deg, rgba(19, 24, 32, 0.98), rgba(13, 17, 23, 0.98));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.plot-panel {
+  padding: 8px 10px 10px;
+}
+
+.plot-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.plot-title-row h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.ws-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.chart {
+  width: 100%;
+  height: 285px;
+  display: block;
+  background: #ffffff;
+  border-radius: 6px;
+}
+
+.manual-panel {
+  padding: 8px 10px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.toolbar-gap {
+  display: inline-block;
+  width: 16px;
+}
+
+.small-gap {
+  width: 10px;
+}
+
+.group-box {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 10px 8px;
+  margin-bottom: 8px;
+  position: relative;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.no-bottom-margin {
+  margin-bottom: 0;
+}
+
+.group-title {
+  position: absolute;
+  top: -10px;
+  left: 10px;
+  padding: 0 6px;
+  background: var(--panel);
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.group-row:last-child {
+  margin-bottom: 0;
+}
+
+.profile-row {
+  align-items: stretch;
+}
+
+.inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+  color: var(--muted);
+}
+
+.fixed-label select {
+  min-width: 220px;
+}
+
+.grow {
+  flex: 1 1 300px;
+}
+
+.grow input {
+  width: 100%;
+}
+
+.row-stretch {
+  flex: 1 1 auto;
+}
+
+.metric-label {
+  font-weight: 600;
+}
+
+.live-value {
+  min-width: 190px;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.live-red {
+  color: #ff6565;
+}
+
+.live-blue {
+  color: #73a8ff;
+}
+
+.live-darkred {
+  color: #ff8a8a;
+  min-width: 240px;
+}
+
+input,
+select,
+button {
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+}
+
+input,
+select {
+  padding: 4px 8px;
+}
+
+button {
+  padding: 0 12px;
+  cursor: pointer;
+  background: var(--panel-2);
+}
+
+button:hover {
+  background: var(--hover);
+}
+
+button.active {
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  color: #fff;
+  border-color: var(--accent);
+  font-weight: 700;
+}
+
+button.danger {
+  color: #ffd1d1;
+  border-color: var(--danger-border);
+  background: linear-gradient(180deg, #4f1818, var(--danger));
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.w-60 { width: 60px; }
+.w-100 { width: 100px; }
+.w-120 { width: 120px; }
+
+.lamp {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: inline-block;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.lamp.on {
+  background: #00c853;
+  box-shadow: 0 0 10px rgba(0, 200, 83, 0.55);
+}
+
+.lamp.off {
+  background: #c62828;
+  box-shadow: 0 0 10px rgba(198, 40, 40, 0.42);
+}
+
+.status-bar {
+  min-height: 34px;
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+#lbl-stage,
+#lbl-log {
+  color: var(--muted);
+}
+
+#lbl-log {
+  flex: 1 1 320px;
+  min-width: 220px;
+  word-break: break-all;
+}
+
+#lbl-error {
+  color: #ff6d6d;
+  font-weight: 600;
+}
