@@ -8,66 +8,30 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from openpyxl import load_workbook
 from serial.tools import list_ports
-
-from controller.runtime_types import PsuSnapshot, PsuTarget, VescSnapshot, VescTarget, make_command
-from controller.workers import logger_worker_main, psu_worker_main, vesc_worker_main
-from scheme.startup import StartupConfig
 
 from controller.cycle_fsm import CycleFSM
 from controller.cyclogram_startup import build_cooling_fsm, build_startup_fsm
-from controller.pump_profile import load_pump_profile_xlsx
+from controller.pump_profile import interp_profile, load_pump_profile_xlsx
+from controller.runtime_types import (
+    PsuSnapshot,
+    PsuTarget,
+    VescSnapshot,
+    VescTarget,
+    make_command,
+)
+from controller.workers import logger_worker_main, psu_worker_main, vesc_worker_main
 from scheme.cycle import CycleInputs
 from scheme.pump_profile import PumpProfile
-
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, float(v)))
+from scheme.startup import StartupConfig
 
 
-def _interp_profile(xs: list[float], ys: list[float], x: float) -> float:
-    if not xs or not ys:
-        return 0.0
-    if len(xs) == 1:
-        return float(ys[0])
-    if x <= xs[0]:
-        return float(ys[0])
-    if x >= xs[-1]:
-        return float(ys[-1])
-
-    for i in range(1, len(xs)):
-        x0 = xs[i - 1]
-        x1 = xs[i]
-        if x <= x1:
-            y0 = ys[i - 1]
-            y1 = ys[i]
-            if x1 == x0:
-                return float(y1)
-            a = (x - x0) / (x1 - x0)
-            return float(y0 + a * (y1 - y0))
-    return float(ys[-1])
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
 
 
-def _load_profile_xlsx(path: str) -> tuple[list[float], list[float]]:
-    wb = load_workbook(filename=path, data_only=True, read_only=True)
-    ws = wb.active
-
-    points: list[tuple[float, float]] = []
-    for row in ws.iter_rows(values_only=True):
-        if not row or len(row) < 2:
-            continue
-        try:
-            t = float(row[0])
-            rpm = float(row[1])
-        except Exception:
-            continue
-        points.append((t, rpm))
-
-    if not points:
-        raise ValueError("Pump profile XLSX must contain at least two numeric columns: time, rpm")
-
-    points.sort(key=lambda x: x[0])
-    return [p[0] for p in points], [p[1] for p in points]
+def _stage_public_name(name: str) -> str:
+    return (name or "idle").strip().lower()
 
 
 class _ProcHandle:
@@ -82,15 +46,10 @@ class _ProcHandle:
         self.stop_evt = ctx.Event()
         self.proc: mp.Process | None = None
 
-        self._fsm: CycleFSM | None = None
-        self._fsm_prev_state: str | None = None
-
-        self._pump_profile_obj = PumpProfile([], [])
-        self._starter_profile_obj = PumpProfile([], [])
-
     def start(self) -> None:
         if self.proc is not None and self.proc.is_alive():
             return
+
         self.stop_evt.clear()
         self.proc = self.ctx.Process(
             target=self.target,
@@ -106,8 +65,10 @@ class _ProcHandle:
             self.cmd_q.put_nowait({"kind": "__stop__", "payload": {}})
         except Exception:
             pass
+
         if self.proc is not None and self.proc.is_alive():
             self.proc.join(timeout=2.0)
+
         if self.proc is not None and self.proc.is_alive():
             self.proc.terminate()
             self.proc.join(timeout=1.0)
@@ -136,10 +97,12 @@ class WebControllerRuntime:
         self.dt = float(dt)
         self.ui_hz = 5.0
         self.log_hz = 5.0
-        self.stale_worker_s = 1.0
 
         self._ui_dt = 1.0 / self.ui_hz
         self._log_dt = 1.0 / self.log_hz
+
+        self.stale_vesc_s = 1.0
+        self.stale_psu_s = 2.0
 
         self._lock = threading.RLock()
         self._stop_evt = threading.Event()
@@ -151,10 +114,9 @@ class WebControllerRuntime:
         self._psu_proc = _ProcHandle(self._ctx, "psu", psu_worker_main, (0.02, 0.5, 0.2, 115200, 0.2, 1))
         self._logger_proc = _ProcHandle(self._ctx, "logger", logger_worker_main, ("logs",))
 
-        self._cfg = StartupConfig()
+        self.startup_cfg = StartupConfig()
 
-        self._session_t0 = time.monotonic()
-        self._stage_t0 = self._session_t0
+        self._t0 = time.monotonic()
         self._last_ui = 0.0
         self._last_log = 0.0
 
@@ -166,31 +128,36 @@ class WebControllerRuntime:
         self._starter_snap = VescSnapshot()
         self._psu_snap = PsuSnapshot()
 
-        self._pump_manual = VescTarget(mode="rpm", value=0.0)
-        self._starter_manual = VescTarget(mode="duty", value=0.0)
-        self._psu_manual = PsuTarget(v=0.0, i=0.0, out=False)
+        self.pump_target = {"mode": "rpm", "value": 0.0}
+        self.starter_target = {"mode": "duty", "value": 0.0}
+        self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
 
-        self._startup_active = False
-        self._cooling_active = False
-        self._cooling_until = 0.0
+        self._fsm: CycleFSM | None = None
+        self._fsm_prev_state: str | None = None
 
-        self._pump_profile_active = False
-        self._pump_profile_path = ""
-        self._pump_profile_t: list[float] = []
-        self._pump_profile_rpm: list[float] = []
-        self._pump_profile_t0 = 0.0
+        self._pump_prof_active = False
+        self._pump_prof_path = ""
+        self._pump_prof: PumpProfile | None = None
+        self._pump_prof_t0 = 0.0
+
+        self._run_pump_profile: PumpProfile | None = None
+        self._run_starter_profile: PumpProfile = PumpProfile([], [])
 
         self._valve_macro_active = False
         self._valve_macro_t0 = 0.0
 
-        self._holds: dict[str, float] = {}
         self._seq = 0
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
 
         self._stop_evt.clear()
+
         self._pump_proc.start()
         self._starter_proc.start()
         self._psu_proc.start()
@@ -216,6 +183,10 @@ class WebControllerRuntime:
         self._psu_proc.stop()
         self._logger_proc.stop()
 
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
+
     def list_ports(self) -> list[str]:
         items = []
         for p in list_ports.comports():
@@ -230,13 +201,6 @@ class WebControllerRuntime:
             "sample": self._build_sample(),
             "last_error": self._last_error,
         }
-
-    def _next_seq(self) -> int:
-        self._seq += 1
-        return self._seq
-
-    def _post(self, proc: _ProcHandle, worker: str, kind: str, payload: dict[str, Any]) -> None:
-        proc.post(make_command(worker=worker, kind=kind, payload=payload, seq=self._next_seq()))
 
     def cmd_connect_pump(self, port: str) -> None:
         port = str(port or "").strip()
@@ -266,78 +230,118 @@ class WebControllerRuntime:
         self._post(self._psu_proc, "psu", "disconnect", {})
 
     def cmd_set_pole_pairs_pump(self, pole_pairs: int) -> None:
-        self._post(self._pump_proc, "pump", "set_pole_pairs", {"pole_pairs": max(1, int(pole_pairs))})
+        self._post(
+            self._pump_proc,
+            "pump",
+            "set_pole_pairs",
+            {"pole_pairs": max(1, int(pole_pairs))},
+        )
 
     def cmd_set_pole_pairs_starter(self, pole_pairs: int) -> None:
-        self._post(self._starter_proc, "starter", "set_pole_pairs", {"pole_pairs": max(1, int(pole_pairs))})
+        self._post(
+            self._starter_proc,
+            "starter",
+            "set_pole_pairs",
+            {"pole_pairs": max(1, int(pole_pairs))},
+        )
 
     def cmd_ready(self, prefix: str = "manual") -> None:
         now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._pump_manual = VescTarget(mode="rpm", value=0.0)
-            self._starter_manual = VescTarget(mode="duty", value=0.0)
-            self._psu_manual = PsuTarget(v=0.0, i=0.0, out=False)
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+
+            self._t0 = now
             self._stage = "ready"
-            self._stage_t0 = now
-            self._session_t0 = now
             self._last_error = ""
+
+            self.pump_target = {"mode": "rpm", "value": 0.0}
+            self.starter_target = {"mode": "duty", "value": 0.0}
+            self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+
         self._post(self._logger_proc, "logger", "open", {"prefix": prefix or "manual"})
-        self._publish("status", {**self._build_status(), "ready": True})
+        self._publish("status", {**self._build_status(), "ready": True, "reset_plot": True})
 
     def cmd_update_reset(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._t0 = now
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+            self._stage = "idle"
         self._publish("status", {**self._build_status(), "reset_plot": True})
 
     def cmd_run_cycle(self) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+
+            if self._run_pump_profile is None or not self._run_pump_profile.t:
+                raise ValueError("Спочатку завантаж pump profile (.xlsx)")
+
+            now = time.monotonic()
             inp = self._make_inputs(now)
-            self._fsm = build_startup_fsm(self._pump_profile_obj, self._starter_profile_obj, self._cfg)
+
+            self._fsm = build_startup_fsm(
+                self._run_pump_profile,
+                self._run_starter_profile,
+                self.startup_cfg,
+            )
             self._fsm_prev_state = None
             self._fsm.start(inp)
-            self._stage = self._fsm.state
-            self._stage_t0 = now
-            self._holds.clear()
+            self._stage = _stage_public_name(self._fsm.state)
 
     def cmd_cooling_cycle(self, value: float) -> None:
-        duration_s = max(0.1, float(value))
-        now = time.monotonic()
-        inp = self._make_inputs(now)
-        self._fsm = build_cooling_fsm(float(value))
-        self._fsm_prev_state = None
-        self._fsm.start(inp)
-        self._stage = self._fsm.state
-        self._stage_t0 = now
+        with self._lock:
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+
+            now = time.monotonic()
+            inp = self._make_inputs(now)
+
+            self._fsm = build_cooling_fsm(float(value))
+            self._fsm_prev_state = None
+            self._fsm.start(inp)
+            self._stage = _stage_public_name(self._fsm.state)
 
     def cmd_stop_all(self) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._pump_manual = VescTarget(mode="rpm", value=0.0)
-            self._starter_manual = VescTarget(mode="duty", value=0.0)
-            self._psu_manual = PsuTarget(v=self._psu_manual.v, i=self._psu_manual.i, out=False)
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
             self._stage = "stop"
-            self._stage_t0 = now
+
+            self.pump_target = {"mode": "rpm", "value": 0.0}
+            self.starter_target = {"mode": "duty", "value": 0.0}
+            self.psu_target = {
+                "v": float(self.psu_target.get("v", 0.0)),
+                "i": float(self.psu_target.get("i", 0.0)),
+                "out": False,
+            }
 
     def cmd_valve_on(self) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_startup_only_locked()
+            if not self._psu_snap.connected:
+                raise ValueError("Valve: PSU not connected")
+
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+
             self._valve_macro_active = True
-            self._valve_macro_t0 = now
-            if self._stage not in {"ready", "idle", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._valve_macro_t0 = time.monotonic()
+            self._stage = "manual"
 
     def cmd_valve_off(self) -> None:
-        now = time.monotonic()
         with self._lock:
             self._valve_macro_active = False
-            self._psu_manual.out = False
-            if self._stage not in {"ready", "idle", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stage = "manual"
+            self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
 
     def cmd_start_pump_profile(self, path: str) -> None:
         raw = str(path or "").strip()
@@ -346,90 +350,228 @@ class WebControllerRuntime:
         if not Path(raw).exists():
             raise ValueError(f"Pump profile file not found: {raw}")
 
-        xs, ys = _load_profile_xlsx(raw)
-        now = time.monotonic()
+        prof = load_pump_profile_xlsx(raw, sheet_name=None)
+        if not prof.t:
+            raise ValueError("Pump profile is empty")
 
+        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._pump_profile_active = True
-            self._pump_profile_path = raw
-            self._pump_profile_t = xs
-            self._pump_profile_rpm = ys
-            self._pump_profile_t0 = now
+            self._fsm = None
+            self._fsm_prev_state = None
+
+            self._pump_prof = prof
+            self._run_pump_profile = prof
+
+            self._pump_prof_active = True
+            self._pump_prof_path = raw
+            self._pump_prof_t0 = now
             self._stage = "pump_profile"
-            self._stage_t0 = now
 
     def cmd_stop_pump_profile(self) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._pump_profile_active = False
-            self._pump_profile_path = ""
-            self._pump_profile_t = []
-            self._pump_profile_rpm = []
+            self._stop_pump_profile_internal()
             if self._stage == "pump_profile":
                 self._stage = "manual"
-                self._stage_t0 = now
+            self.pump_target = {"mode": "rpm", "value": 0.0}
 
     def cmd_set_pump_rpm(self, value: float) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._pump_manual = VescTarget(mode="rpm", value=float(value))
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+
+            if self._fsm is not None and self._fsm.state == "Running":
+                self.pump_target = {"mode": "rpm", "value": float(value)}
+                return
+
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stage = "manual"
+            self.pump_target = {"mode": "rpm", "value": float(value)}
 
     def cmd_set_pump_duty(self, value: float) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._pump_manual = VescTarget(mode="duty", value=_clamp(value, 0.0, 1.0))
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+
+            if self._fsm is not None and self._fsm.state == "Running":
+                self.pump_target = {"mode": "duty", "value": _clamp01(value)}
+                return
+
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stage = "manual"
+            self.pump_target = {"mode": "duty", "value": _clamp01(value)}
 
     def cmd_set_starter_rpm(self, value: float) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._starter_manual = VescTarget(mode="rpm", value=float(value))
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stage = "manual"
+            self.starter_target = {"mode": "rpm", "value": float(value)}
 
     def cmd_set_starter_duty(self, value: float) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._starter_manual = VescTarget(mode="duty", value=_clamp(value, 0.0, 1.0))
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stage = "manual"
+            self.starter_target = {"mode": "duty", "value": _clamp01(value)}
 
     def cmd_psu_set_vi(self, v: float, i: float) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._psu_manual.v = float(v)
-            self._psu_manual.i = float(i)
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._valve_macro_active = False
+            self._stage = "manual"
+            self.psu_target = {
+                "v": float(v),
+                "i": float(i),
+                "out": bool(self.psu_target.get("out", False)),
+            }
 
     def cmd_psu_output(self, value: bool) -> None:
-        now = time.monotonic()
         with self._lock:
-            self._cancel_automation_locked()
-            self._psu_manual.out = bool(value)
-            if self._stage not in {"idle", "ready", "stop"}:
-                self._stage = "manual"
-                self._stage_t0 = now
+            self._stop_pump_profile_internal()
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._valve_macro_active = False
+            self._stage = "manual"
+            self.psu_target = {
+                "v": float(self.psu_target.get("v", 0.0)),
+                "i": float(self.psu_target.get("i", 0.0)),
+                "out": bool(value),
+            }
+
+    # ------------------------------------------------------------------
+    # internal helpers
+    # ------------------------------------------------------------------
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _post(self, proc: _ProcHandle, worker: str, kind: str, payload: dict[str, Any]) -> None:
+        proc.post(make_command(worker=worker, kind=kind, payload=payload, seq=self._next_seq()))
 
     def _publish(self, event: str, payload: Any) -> None:
         try:
             self.publish(event, payload)
         except Exception:
             pass
+
+    def _emit_error(self, text: str) -> None:
+        self._last_error = str(text)
+        self._publish("error", self._last_error)
+
+    def _stop_pump_profile_internal(self) -> None:
+        self._pump_prof_active = False
+        self._pump_prof_path = ""
+        self._pump_prof_t0 = 0.0
+
+    def _make_inputs(self, now: float) -> CycleInputs:
+        state_t = self._fsm.state_time(now) if self._fsm is not None else 0.0
+        return CycleInputs(
+            now=now,
+            t=now - self._t0,
+            state_t=state_t,
+            pump_rpm=float(self._pump_snap.rpm_mech),
+            starter_rpm=float(self._starter_snap.rpm_mech),
+            pump_current=float(self._pump_snap.current_motor),
+            starter_current=float(self._starter_snap.current_motor),
+            psu_v_out=float(self._psu_snap.v_out),
+            psu_i_out=float(self._psu_snap.i_out),
+            psu_output=bool(self._psu_snap.output),
+        )
+
+    def _set_targets_from_fsm(self, targets) -> None:
+        old_state = self._fsm_prev_state or self._fsm.state
+        new_state = self._fsm.state
+
+        self._stage = _stage_public_name(new_state)
+
+        if new_state != old_state:
+            reason = targets.meta.get("transition_reason")
+            if new_state == "Fault" and reason:
+                self._emit_error(str(reason))
+
+        apply_pump = new_state != "Running"
+        if (not apply_pump) and (old_state != "Running") and (new_state == "Running"):
+            if targets.meta.get("apply_pump_once_on_running_entry"):
+                apply_pump = True
+
+        if apply_pump:
+            self.pump_target = dict(targets.pump)
+
+        self.starter_target = dict(targets.starter)
+        self.psu_target = dict(targets.psu)
+        self._fsm_prev_state = new_state
+
+    def _safe_zero_outputs(self) -> None:
+        try:
+            self._post(self._pump_proc, "pump", "set_target", {"mode": "rpm", "value": 0.0})
+            self._post(self._starter_proc, "starter", "set_target", {"mode": "duty", "value": 0.0})
+            self._post(
+                self._psu_proc,
+                "psu",
+                "set_target",
+                {
+                    "v": float(self.psu_target.get("v", 0.0)),
+                    "i": float(self.psu_target.get("i", 0.0)),
+                    "out": False,
+                },
+            )
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # worker event handling
+    # ------------------------------------------------------------------
+
+    def _drain_worker_events(self) -> None:
+        for proc in (self._pump_proc, self._starter_proc, self._psu_proc, self._logger_proc):
+            for evt in proc.drain_events():
+                worker = str(evt.get("worker", ""))
+                kind = str(evt.get("kind", ""))
+                payload = evt.get("payload", {}) or {}
+
+                if worker == "pump" and kind == "snapshot":
+                    self._pump_snap = VescSnapshot(**payload)
+                elif worker == "starter" and kind == "snapshot":
+                    self._starter_snap = VescSnapshot(**payload)
+                elif worker == "psu" and kind == "snapshot":
+                    self._psu_snap = PsuSnapshot(**payload)
+                elif worker == "logger" and kind == "state":
+                    self._logger_path = str(payload.get("log_path", "") or "")
+                    err = payload.get("error")
+                    if err:
+                        self._emit_error(str(err))
+
+                if kind == "error":
+                    msg = str(payload.get("message", "worker error"))
+                    self._emit_error(f"{worker}: {msg}")
+
+    def _check_stale(self, now: float) -> None:
+        if self._pump_snap.connected and (now - self._pump_snap.ts) > self.stale_vesc_s:
+            self._fsm = None
+            self._stage = "fault"
+            self._emit_error("pump worker stale timeout")
+            return
+
+        if self._starter_snap.connected and (now - self._starter_snap.ts) > self.stale_vesc_s:
+            self._fsm = None
+            self._stage = "fault"
+            self._emit_error("starter worker stale timeout")
+            return
+
+        if self._psu_snap.connected and (now - self._psu_snap.ts) > self.stale_psu_s:
+            self._fsm = None
+            self._stage = "fault"
+            self._emit_error("psu worker stale timeout")
+
+    # ------------------------------------------------------------------
+    # main loop
+    # ------------------------------------------------------------------
 
     def _run_loop(self) -> None:
         next_tick = time.monotonic()
@@ -450,55 +592,55 @@ class WebControllerRuntime:
         self._drain_worker_events()
 
         with self._lock:
-            pump_target = VescTarget(self._pump_manual.mode, self._pump_manual.value)
-            starter_target = VescTarget(self._starter_manual.mode, self._starter_manual.value)
-            psu_target = PsuTarget(self._psu_manual.v, self._psu_manual.i, self._psu_manual.out)
+            self._check_stale(now)
 
-            if self._pump_profile_active:
-                dt_profile = now - self._pump_profile_t0
-                pump_target = VescTarget(
-                    mode="rpm",
-                    value=_interp_profile(self._pump_profile_t, self._pump_profile_rpm, dt_profile),
-                )
-                if dt_profile >= (self._pump_profile_t[-1] if self._pump_profile_t else 0.0):
-                    self._pump_profile_active = False
+            if self._fsm is None and self._pump_prof_active and self._pump_prof is not None:
+                elapsed = now - self._pump_prof_t0
+                end_t = self._pump_prof.end_time
+
+                if end_t > 0.0 and elapsed >= end_t:
+                    self._stop_pump_profile_internal()
+                    self.pump_target = {"mode": "rpm", "value": 0.0}
                     if self._stage == "pump_profile":
                         self._stage = "manual"
-                        self._stage_t0 = now
 
-            if self._startup_active:
-                pump_target = VescTarget(self._pump_manual.mode, self._pump_manual.value)
-                starter_target = VescTarget(self._starter_manual.mode, self._starter_manual.value)
+                if self._pump_prof_active:
+                    rpm_cmd = interp_profile(self._pump_prof, elapsed)
+                    self.pump_target = {"mode": "rpm", "value": float(rpm_cmd)}
+                    self._stage = "pump_profile"
 
-            if self._cooling_active:
-                if now >= self._cooling_until:
-                    self._cooling_active = False
-                    self._stage = "stop"
-                    self._stage_t0 = now
+            if self._fsm is not None:
+                inp = self._make_inputs(now)
+                targets = self._fsm.tick(inp)
+                self._set_targets_from_fsm(targets)
+
+                if not self._fsm.running and self._fsm.state in {"Stop", "Fault"}:
+                    self._stage = _stage_public_name(self._fsm.state)
+                    self._fsm = None
+                    self._fsm_prev_state = None
+
+            if self._fsm is None and self._valve_macro_active:
+                elapsed = now - self._valve_macro_t0
+                if elapsed < self.startup_cfg.valve_boost_s:
+                    self.psu_target = {
+                        "v": float(self.startup_cfg.valve_boost_v),
+                        "i": float(self.startup_cfg.valve_boost_i),
+                        "out": True,
+                    }
                 else:
-                    starter_target = VescTarget(mode="duty", value=0.0)
-                    psu_target = PsuTarget(v=psu_target.v, i=psu_target.i, out=False)
+                    self.psu_target = {
+                        "v": float(self.startup_cfg.valve_hold_v),
+                        "i": float(self.startup_cfg.valve_hold_i),
+                        "out": True,
+                    }
 
-            if self._valve_macro_active:
-                dt_valve = now - self._valve_macro_t0
-                if dt_valve < self._cfg.valve_boost_s:
-                    psu_target = PsuTarget(
-                        v=self._cfg.valve_boost_v,
-                        i=self._cfg.valve_boost_i,
-                        out=True,
-                    )
-                else:
-                    psu_target = PsuTarget(
-                        v=self._cfg.valve_hold_v,
-                        i=self._cfg.valve_hold_i,
-                        out=True,
-                    )
+            pump_target = dict(self.pump_target)
+            starter_target = dict(self.starter_target)
+            psu_target = dict(self.psu_target)
 
-        self._post(self._pump_proc, "pump", "set_target", {"mode": pump_target.mode, "value": pump_target.value})
-        self._post(self._starter_proc, "starter", "set_target", {"mode": starter_target.mode, "value": starter_target.value})
-        self._post(self._psu_proc, "psu", "set_target", {"v": psu_target.v, "i": psu_target.i, "out": psu_target.out})
-
-        self._check_stale(now)
+        self._post(self._pump_proc, "pump", "set_target", pump_target)
+        self._post(self._starter_proc, "starter", "set_target", starter_target)
+        self._post(self._psu_proc, "psu", "set_target", psu_target)
 
         if (now - self._last_ui) >= self._ui_dt:
             self._last_ui = now
@@ -509,160 +651,9 @@ class WebControllerRuntime:
             self._last_log = now
             self._post(self._logger_proc, "logger", "row", self._build_log_row())
 
-    def _drain_worker_events(self) -> None:
-        for proc in (self._pump_proc, self._starter_proc, self._psu_proc, self._logger_proc):
-            for evt in proc.drain_events():
-                worker = str(evt.get("worker", ""))
-                kind = str(evt.get("kind", ""))
-                payload = evt.get("payload", {}) or {}
-
-                if worker == "pump" and kind == "snapshot":
-                    self._pump_snap = VescSnapshot(**payload)
-                elif worker == "starter" and kind == "snapshot":
-                    self._starter_snap = VescSnapshot(**payload)
-                elif worker == "psu" and kind == "snapshot":
-                    self._psu_snap = PsuSnapshot(**payload)
-                elif worker == "logger" and kind == "state":
-                    self._logger_path = str(payload.get("log_path", "") or "")
-                    err = payload.get("error")
-                    if err:
-                        self._last_error = str(err)
-                        self._publish("error", self._last_error)
-
-                if kind == "error":
-                    msg = str(payload.get("message", "worker error"))
-                    self._last_error = f"{worker}: {msg}"
-                    self._publish("error", self._last_error)
-
-    def _check_stale(self, now: float) -> None:
-        snaps = [self._pump_snap, self._starter_snap]
-        for snap in snaps:
-            if snap.connected and (now - snap.ts) > self.stale_worker_s:
-                self._fault_locked(now, "Worker stale timeout")
-                return
-
-    def _tick_startup_locked(self, now: float) -> None:
-        cfg = self._cfg
-        stage = self._stage
-        stage_dt = now - self._stage_t0
-
-        starter_rpm = float(self._starter_snap.rpm_mech)
-        pump_rpm = float(self._pump_snap.rpm_mech)
-
-        if stage == "starter":
-            duty = self._starter_step_duty(starter_rpm)
-            self._starter_manual = VescTarget(mode="duty", value=duty)
-
-            if self._hold_true_locked(
-                "to_fuelramp",
-                starter_rpm >= cfg.to_fuelramp_starter_rpm,
-                now,
-                cfg.to_fuelramp_hold_s,
-            ):
-                self._stage = "fuelramp"
-                self._stage_t0 = now
-                self._holds.clear()
-                self._valve_macro_active = True
-                self._valve_macro_t0 = now
-                return
-
-            if stage_dt >= cfg.starter_timeout_s:
-                self._fault_locked(now, "Starter timeout")
-                return
-
-        elif stage == "fuelramp":
-            duty = self._starter_step_duty(starter_rpm)
-            self._starter_manual = VescTarget(mode="duty", value=duty)
-
-            if self._hold_true_locked(
-                "valve_close",
-                starter_rpm >= cfg.valve_close_rpm,
-                now,
-                cfg.valve_close_hold_s,
-            ):
-                self._valve_macro_active = False
-
-            if self._hold_true_locked(
-                "starter_off",
-                starter_rpm >= cfg.starter_off_rpm,
-                now,
-                cfg.starter_off_hold_s,
-            ):
-                self._starter_manual = VescTarget(mode="duty", value=0.0)
-
-            if self._hold_true_locked(
-                "to_running",
-                starter_rpm >= cfg.to_running_starter_rpm,
-                now,
-                cfg.to_running_hold_s,
-            ):
-                self._startup_active = False
-                self._stage = "running"
-                self._stage_t0 = now
-                self._holds.clear()
-                self._valve_macro_active = False
-                self._starter_manual = VescTarget(mode="duty", value=0.0)
-                self._pump_manual = VescTarget(mode="rpm", value=pump_rpm)
-                return
-
-            if stage_dt >= cfg.fuelramp_timeout_s:
-                self._fault_locked(now, "FuelRamp timeout")
-                return
-
-    def _starter_step_duty(self, starter_rpm: float) -> float:
-        duty = float(self._cfg.starter_steps[0][1])
-        for rpm_thr, d in self._cfg.starter_steps:
-            if starter_rpm >= float(rpm_thr):
-                duty = float(d)
-            else:
-                break
-        return duty
-
-    def _hold_true_locked(self, key: str, cond: bool, now: float, hold_s: float) -> bool:
-        if cond:
-            self._holds.setdefault(key, now)
-            return (now - self._holds[key]) >= float(hold_s)
-        self._holds.pop(key, None)
-        return False
-
-    def _fault_locked(self, now: float, reason: str) -> None:
-        self._cancel_automation_locked()
-        self._pump_manual = VescTarget(mode="rpm", value=0.0)
-        self._starter_manual = VescTarget(mode="duty", value=0.0)
-        self._psu_manual.out = False
-        self._stage = "fault"
-        self._stage_t0 = now
-        self._last_error = str(reason)
-        self._publish("error", self._last_error)
-
-    def _cancel_startup_only_locked(self) -> None:
-        self._startup_active = False
-        self._holds.clear()
-
-    def _cancel_automation_locked(self) -> None:
-        self._startup_active = False
-        self._cooling_active = False
-        self._cooling_until = 0.0
-
-        self._pump_profile_active = False
-        self._pump_profile_path = ""
-        self._pump_profile_t = []
-        self._pump_profile_rpm = []
-        self._pump_profile_t0 = 0.0
-
-        self._valve_macro_active = False
-        self._valve_macro_t0 = 0.0
-
-        self._holds.clear()
-
-    def _safe_zero_outputs(self) -> None:
-        try:
-            self._post(self._pump_proc, "pump", "set_target", {"mode": "rpm", "value": 0.0})
-            self._post(self._starter_proc, "starter", "set_target", {"mode": "duty", "value": 0.0})
-            self._post(self._psu_proc, "psu", "set_target", {"v": self._psu_manual.v, "i": self._psu_manual.i, "out": False})
-            time.sleep(0.1)
-        except Exception:
-            pass
+    # ------------------------------------------------------------------
+    # payload builders
+    # ------------------------------------------------------------------
 
     def _build_status(self) -> dict[str, Any]:
         return {
@@ -674,8 +665,8 @@ class WebControllerRuntime:
             },
             "log_path": self._logger_path,
             "pump_profile": {
-                "active": self._pump_profile_active,
-                "path": self._pump_profile_path,
+                "active": self._pump_prof_active,
+                "path": self._pump_prof_path,
             },
             "valve_macro": {
                 "active": self._valve_macro_active,
@@ -684,7 +675,7 @@ class WebControllerRuntime:
 
     def _build_sample(self) -> dict[str, Any]:
         return {
-            "t": max(0.0, time.monotonic() - self._session_t0),
+            "t": max(0.0, time.monotonic() - self._t0),
             "stage": self._stage,
             "connected": {
                 "pump": self._pump_snap.connected,
