@@ -1,1 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Start-up</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <div class="app">
+    <section class="plot-panel">
+      <div class="plot-title-row">
+        <h1>Start-up</h1>
+        <div class="ws-box">
+          <span id="ws-lamp" class="lamp off"></span>
+          <span id="ws-text">WS: offline</span>
+        </div>
+      </div>
 
+      <canvas id="starter-chart" class="chart"></canvas>
+    </section>
+
+    <section class="manual-panel">
+      <div class="toolbar">
+        <button id="btn-ready">Ready</button>
+        <button id="btn-run">Run</button>
+        <button id="btn-update">Update</button>
+        <button id="btn-stop-all" class="danger">Stop All</button>
+
+        <span class="toolbar-gap"></span>
+
+        <button id="btn-refresh-ports">Refresh ports</button>
+
+        <label class="inline-check">
+          <input id="chk-auto-ports" type="checkbox" />
+          <span>Auto ports</span>
+        </label>
+      </div>
+
+      <div class="group-box">
+        <div class="group-title">Pump VESC</div>
+
+        <div class="group-row">
+          <label class="inline-label fixed-label">
+            <span>COM:</span>
+            <select id="cb-pump"></select>
+          </label>
+
+          <span id="lamp-pump" class="lamp off"></span>
+
+          <button id="btn-pump-connect">Connect</button>
+          <button id="btn-pump-disconnect">Disconnect</button>
+
+          <span class="row-stretch"></span>
+
+          <span class="metric-label">RPM:</span>
+          <span id="lbl-pump-rpm-live" class="live-value live-red">0 rpm</span>
+        </div>
+
+        <div class="group-row">
+          <label class="inline-label">
+            <span>pole pairs:</span>
+            <input id="pp-pump" class="w-60" type="number" value="7" />
+          </label>
+
+          <label class="inline-label">
+            <span>duty:</span>
+            <input id="in-pump-duty" class="w-100" type="number" step="0.01" value="0.07" />
+          </label>
+
+          <button id="btn-pump-set-duty">Set duty</button>
+
+          <label class="inline-label">
+            <span>rpm(mech):</span>
+            <input id="in-pump-rpm" class="w-120" type="number" step="1" value="2600" />
+          </label>
+
+          <button id="btn-pump-set-rpm">Set rpm</button>
+          <button id="btn-pump-stop">Stop</button>
+        </div>
+
+        <div class="group-row profile-row">
+          <label class="inline-label grow">
+            <span>Pump profile XLSX:</span>
+            <input id="in-pump-profile-path" type="text" placeholder="file_cyclogram/_Cyclogram_Pump.xlsx" />
+          </label>
+
+          <button id="btn-pump-profile-browse">Browse...</button>
+          <button id="btn-pump-profile-start">Start profile</button>
+        </div>
+      </div>
+
+      <div class="group-box">
+        <div class="group-title">Starter VESC</div>
+
+        <div class="group-row">
+          <label class="inline-label fixed-label">
+            <span>COM:</span>
+            <select id="cb-starter"></select>
+          </label>
+
+          <span id="lamp-starter" class="lamp off"></span>
+
+          <button id="btn-starter-connect">Connect</button>
+          <button id="btn-starter-disconnect">Disconnect</button>
+
+          <span class="row-stretch"></span>
+
+          <span class="metric-label">RPM:</span>
+          <span id="lbl-starter-rpm-live" class="live-value live-blue">0 rpm</span>
+        </div>
+
+        <div class="group-row">
+          <label class="inline-label">
+            <span>pole pairs:</span>
+            <input id="pp-starter" class="w-60" type="number" value="3" />
+          </label>
+
+          <label class="inline-label">
+            <span>duty:</span>
+            <input id="in-starter-duty" class="w-100" type="number" step="0.01" value="0.05" />
+          </label>
+
+          <button id="btn-starter-set-duty">Set duty</button>
+
+          <label class="inline-label">
+            <span>rpm(mech):</span>
+            <input id="in-starter-rpm" class="w-120" type="number" step="1" value="1000" />
+          </label>
+
+          <button id="btn-starter-set-rpm">Set rpm</button>
+          <button id="btn-starter-stop">Stop</button>
+        </div>
+      </div>
+
+      <div class="group-box no-bottom-margin">
+        <div class="group-title">PSU (RD6024)</div>
+
+        <div class="group-row">
+          <label class="inline-label fixed-label">
+            <span>COM:</span>
+            <select id="cb-psu"></select>
+          </label>
+
+          <span id="lamp-psu" class="lamp off"></span>
+
+          <button id="btn-psu-connect">Connect</button>
+          <button id="btn-psu-disconnect">Disconnect</button>
+
+          <span class="row-stretch"></span>
+
+          <span class="metric-label">V/I:</span>
+          <span id="lbl-psu-live" class="live-value live-darkred">0.0V / 0.0A</span>
+        </div>
+
+        <div class="group-row">
+          <label class="inline-label">
+            <span>V:</span>
+            <input id="in-psu-v" class="w-100" type="number" step="0.1" value="0.0" />
+          </label>
+
+          <label class="inline-label">
+            <span>I:</span>
+            <input id="in-psu-i" class="w-100" type="number" step="0.1" value="20.0" />
+          </label>
+
+          <button id="btn-psu-set">Set V/I</button>
+          <button id="btn-psu-on">Output ON</button>
+          <button id="btn-psu-off">Output OFF</button>
+
+          <span class="toolbar-gap small-gap"></span>
+
+          <button id="btn-valve-on">On Valve</button>
+          <button id="btn-valve-off">Off Valve</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="status-bar">
+      <div id="lbl-stage">stage: -</div>
+      <div id="lbl-log">log: -</div>
+      <div id="lbl-error"></div>
+    </section>
+  </div>
+</body>
+</html>
