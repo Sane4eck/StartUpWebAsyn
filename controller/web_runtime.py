@@ -15,6 +15,11 @@ from controller.runtime_types import PsuSnapshot, PsuTarget, VescSnapshot, VescT
 from controller.workers import logger_worker_main, psu_worker_main, vesc_worker_main
 from scheme.startup import StartupConfig
 
+from controller.cycle_fsm import CycleFSM
+from controller.cyclogram_startup import build_cooling_fsm, build_startup_fsm
+from controller.pump_profile import load_pump_profile_xlsx
+from scheme.cycle import CycleInputs
+from scheme.pump_profile import PumpProfile
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, float(v)))
@@ -76,6 +81,12 @@ class _ProcHandle:
         self.evt_q = ctx.Queue()
         self.stop_evt = ctx.Event()
         self.proc: mp.Process | None = None
+
+        self._fsm: CycleFSM | None = None
+        self._fsm_prev_state: str | None = None
+
+        self._pump_profile_obj = PumpProfile([], [])
+        self._starter_profile_obj = PumpProfile([], [])
 
     def start(self) -> None:
         if self.proc is not None and self.proc.is_alive():
@@ -281,20 +292,23 @@ class WebControllerRuntime:
         now = time.monotonic()
         with self._lock:
             self._cancel_automation_locked()
-            self._startup_active = True
-            self._stage = "starter"
+            inp = self._make_inputs(now)
+            self._fsm = build_startup_fsm(self._pump_profile_obj, self._starter_profile_obj, self._cfg)
+            self._fsm_prev_state = None
+            self._fsm.start(inp)
+            self._stage = self._fsm.state
             self._stage_t0 = now
             self._holds.clear()
 
     def cmd_cooling_cycle(self, value: float) -> None:
         duration_s = max(0.1, float(value))
         now = time.monotonic()
-        with self._lock:
-            self._cancel_automation_locked()
-            self._cooling_active = True
-            self._cooling_until = now + duration_s
-            self._stage = "cooling"
-            self._stage_t0 = now
+        inp = self._make_inputs(now)
+        self._fsm = build_cooling_fsm(float(value))
+        self._fsm_prev_state = None
+        self._fsm.start(inp)
+        self._stage = self._fsm.state
+        self._stage_t0 = now
 
     def cmd_stop_all(self) -> None:
         now = time.monotonic()
@@ -453,7 +467,6 @@ class WebControllerRuntime:
                         self._stage_t0 = now
 
             if self._startup_active:
-                self._tick_startup_locked(now)
                 pump_target = VescTarget(self._pump_manual.mode, self._pump_manual.value)
                 starter_target = VescTarget(self._starter_manual.mode, self._starter_manual.value)
 
