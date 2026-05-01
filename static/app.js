@@ -775,7 +775,40 @@ $("btn-update").onclick = async () => {
       setError(e.message || String(e));
     }
   };
+  $("btn-hall-connect").onclick = async () => {
+      try {
+        await saveHallPairs();
+        await api("/api/hall/connect", "POST", { port: $("cb-hall").value });
+        setError("");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    };
 
+  $("btn-hall-disconnect").onclick = async () => {
+      try {
+        await api("/api/hall/disconnect");
+        setError("");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    };
+
+  $("hall-pairs").addEventListener("change", async () => {
+      try {
+        await saveHallPairs();
+        setError("");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    });
+
+    ["plot-starter-rpm", "plot-hall-rpm", "plot-starter-duty", "plot-starter-current"].forEach((id) => {
+      const el = $(id);
+      if (el) {
+        el.addEventListener("change", drawStarterChart);
+      }
+    });
   $("btn-pump-set-duty").onclick = async () => {
     try {
       await savePolePairs();
