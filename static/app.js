@@ -10,6 +10,7 @@ const state = {
     starterRpm: [],
     starterDuty: [],
     starterCur: [],
+    hallRpm: [],
     startedAt: null,
     maxSeconds: 30,
     maxPoints: 1200,
@@ -73,7 +74,7 @@ function parsePorts(payload) {
 
 function fillPorts(ports) {
   state.ports = ports || [];
-  ["cb-pump", "cb-starter", "cb-psu"].forEach((id) => {
+  ["cb-pump", "cb-starter", "cb-psu", "cb-hall"].forEach((id) => {
     const cb = $(id);
     const current = cb.value;
     cb.innerHTML = "";
@@ -123,6 +124,7 @@ function resetPlot() {
   state.plot.starterRpm = [];
   state.plot.starterDuty = [];
   state.plot.starterCur = [];
+  state.plot.hallRpm = [];
   state.plot.startedAt = null;
   drawStarterChart();
 }
@@ -133,6 +135,7 @@ function numOrNull(v) {
 
 function pushPlot(sample) {
   const starter = sample?.starter || {};
+  const hall = sample?.hall || {};
   const now = performance.now() / 1000;
 
   if (state.plot.startedAt === null) {
@@ -145,12 +148,14 @@ function pushPlot(sample) {
   state.plot.starterRpm.push(numOrNull(starter.rpm_mech));
   state.plot.starterDuty.push(numOrNull(starter.duty));
   state.plot.starterCur.push(numOrNull(starter.current_motor));
+  state.plot.hallRpm.push(numOrNull(hall.rpm));
 
   while (state.plot.t.length > state.plot.maxPoints) {
     state.plot.t.shift();
     state.plot.starterRpm.shift();
     state.plot.starterDuty.shift();
     state.plot.starterCur.shift();
+    state.plot.hallRpm.shift();
   }
 
   const maxSeconds = state.plot.maxSeconds;
@@ -159,9 +164,15 @@ function pushPlot(sample) {
     state.plot.starterRpm.shift();
     state.plot.starterDuty.shift();
     state.plot.starterCur.shift();
+    state.plot.hallRpm.shift();
   }
 
   drawStarterChart();
+}
+
+function chartOn(id) {
+  const el = $(id);
+  return !!(el && el.checked);
 }
 
 function seriesMax(values, fallback, base) {
@@ -281,6 +292,12 @@ function drawStarterChart() {
   const rpm = state.plot.starterRpm;
   const duty = state.plot.starterDuty;
   const cur = state.plot.starterCur;
+  const hall = state.plot.hallRpm;
+
+  const useStarterRpm = chartOn("plot-starter-rpm");
+  const useHallRpm = chartOn("plot-hall-rpm");
+  const useDuty = chartOn("plot-starter-duty");
+  const useCur = chartOn("plot-starter-current");
 
   let tMin = 0;
   let tMax = state.plot.maxSeconds;
@@ -290,9 +307,12 @@ function drawStarterChart() {
     tMin = Math.max(0, tMax - state.plot.maxSeconds);
   }
 
-  const rpmVals = rpm.filter((v) => v !== null);
-  const dutyVals = duty.filter((v) => v !== null);
-  const curVals = cur.filter((v) => v !== null);
+  const rpmVals = [
+    ...(useStarterRpm ? rpm.filter((v) => v !== null) : []),
+    ...(useHallRpm ? hall.filter((v) => v !== null) : []),
+  ];
+  const dutyVals = useDuty ? duty.filter((v) => v !== null) : [];
+  const curVals = useCur ? cur.filter((v) => v !== null) : [];
 
   const rpmMax = seriesMax(rpmVals, 1000, 1000);
   const dutyMax = seriesMax(dutyVals, 0.1, 0.1);
@@ -310,21 +330,33 @@ function drawStarterChart() {
   const mapCurY = (y) =>
     pad.top + (1 - (y - curRange.min) / Math.max(1e-9, curRange.max - curRange.min)) * plotH;
 
-  ctx.strokeStyle = "#000000";
-  ctx.lineWidth = 2;
-  drawSeries(ctx, t, rpm, mapX, mapLeftY, tMin);
+  if (useStarterRpm) {
+    ctx.strokeStyle = "#000000";
+    ctx.lineWidth = 2;
+    drawSeries(ctx, t, rpm, mapX, mapLeftY, tMin);
+  }
 
-  ctx.strokeStyle = "#008000";
-  ctx.lineWidth = 2;
-  ctx.setLineDash([8, 6]);
-  drawSeries(ctx, t, duty, mapX, mapDutyY, tMin);
-  ctx.setLineDash([]);
+  if (useHallRpm) {
+    ctx.strokeStyle = "#7b1fa2";
+    ctx.lineWidth = 2;
+    drawSeries(ctx, t, hall, mapX, mapLeftY, tMin);
+  }
 
-  ctx.strokeStyle = "#c00000";
-  ctx.lineWidth = 2;
-  ctx.setLineDash([3, 6]);
-  drawSeries(ctx, t, cur, mapX, mapCurY, tMin);
-  ctx.setLineDash([]);
+  if (useDuty) {
+    ctx.strokeStyle = "#008000";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    drawSeries(ctx, t, duty, mapX, mapDutyY, tMin);
+    ctx.setLineDash([]);
+  }
+
+  if (useCur) {
+    ctx.strokeStyle = "#c00000";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([3, 6]);
+    drawSeries(ctx, t, cur, mapX, mapCurY, tMin);
+    ctx.setLineDash([]);
+  }
 
   ctx.strokeStyle = "#333333";
   ctx.lineWidth = 1.2;
@@ -337,19 +369,23 @@ function drawStarterChart() {
   const dutyAxisX = pad.left + plotW + 8;
   const curAxisX = pad.left + plotW + 62;
 
-  ctx.beginPath();
-  ctx.moveTo(dutyAxisX, pad.top);
-  ctx.lineTo(dutyAxisX, pad.top + plotH);
-  ctx.strokeStyle = "#008000";
-  ctx.stroke();
+  if (useDuty) {
+    ctx.beginPath();
+    ctx.moveTo(dutyAxisX, pad.top);
+    ctx.lineTo(dutyAxisX, pad.top + plotH);
+    ctx.strokeStyle = "#008000";
+    ctx.stroke();
+  }
 
-  ctx.beginPath();
-  ctx.moveTo(curAxisX, pad.top);
-  ctx.lineTo(curAxisX, pad.top + plotH);
-  ctx.strokeStyle = "#c00000";
-  ctx.stroke();
+  if (useCur) {
+    ctx.beginPath();
+    ctx.moveTo(curAxisX, pad.top);
+    ctx.lineTo(curAxisX, pad.top + plotH);
+    ctx.strokeStyle = "#c00000";
+    ctx.stroke();
+  }
 
-  if (curRange.min < 0 && curRange.max > 0) {
+  if (useCur && curRange.min < 0 && curRange.max > 0) {
     const yZero = mapCurY(0);
     ctx.save();
     ctx.strokeStyle = "rgba(192, 0, 0, 0.35)";
@@ -378,21 +414,29 @@ function drawStarterChart() {
     ctx.fillText(xVal.toFixed(0), x - 6, height - 12);
   }
 
-  drawAxisTicks(ctx, dutyAxisX + 6, pad.top, pad.top + plotH, dutyMax, "#008000", "left");
-  drawAxisTicksRange(ctx, curAxisX + 6, pad.top, pad.top + plotH, curRange.min, curRange.max, "#c00000", 1);
+  if (useDuty) {
+    drawAxisTicks(ctx, dutyAxisX + 6, pad.top, pad.top + plotH, dutyMax, "#008000", "left");
+    ctx.fillStyle = "#008000";
+    ctx.fillText("Duty", dutyAxisX - 2, 14);
+  }
+
+  if (useCur) {
+    drawAxisTicksRange(ctx, curAxisX + 6, pad.top, pad.top + plotH, curRange.min, curRange.max, "#c00000", 1);
+    ctx.fillStyle = "#c00000";
+    ctx.fillText("Current", curAxisX - 8, 14);
+  }
 
   ctx.fillStyle = "#222";
   ctx.textAlign = "left";
   ctx.fillText("RPM", 14, 14);
   ctx.fillText("t (s)", pad.left + plotW / 2 - 10, height - 8);
 
-  ctx.fillStyle = "#008000";
-  ctx.fillText("Duty", dutyAxisX - 2, 14);
-
-  ctx.fillStyle = "#c00000";
-  ctx.fillText("Current", curAxisX - 8, 14);
-
-  drawLegend(ctx, pad.left + 10, 16);
+  drawLegend(ctx, pad.left + 10, 16, [
+    ...(useStarterRpm ? [["#000000", "Starter RPM", []]] : []),
+    ...(useHallRpm ? [["#7b1fa2", "Hall RPM", []]] : []),
+    ...(useDuty ? [["#008000", "Starter Duty", [8, 6]]] : []),
+    ...(useCur ? [["#c00000", "Starter Current", [3, 6]]] : []),
+  ]);
 }
 
 function drawSeries(ctx, t, values, mapX, mapY, tMin) {
@@ -414,13 +458,7 @@ function drawSeries(ctx, t, values, mapX, mapY, tMin) {
   ctx.stroke();
 }
 
-function drawLegend(ctx, x, y) {
-  const items = [
-    ["#000000", "Starter RPM", []],
-    ["#008000", "Starter Duty", [8, 6]],
-    ["#c00000", "Starter Current", [3, 6]],
-  ];
-
+function drawLegend(ctx, x, y, items) {
   let offset = 0;
   for (const [color, text, dash] of items) {
     ctx.save();
@@ -437,7 +475,7 @@ function drawLegend(ctx, x, y) {
     ctx.font = "12px Segoe UI, Arial";
     ctx.textAlign = "left";
     ctx.fillText(text, x + offset + 30, y + 4);
-    offset += 112;
+    offset += 120;
   }
 }
 
@@ -502,6 +540,7 @@ function updateStatus(status) {
     setLamp("lamp-pump", !!c.pump);
     setLamp("lamp-starter", !!c.starter);
     setLamp("lamp-psu", !!c.psu);
+    setLamp("lamp-hall", !!c.hall);
   }
 
   if (status.pump_profile) {
@@ -529,17 +568,26 @@ function updateSample(sample) {
   const pump = sample.pump || {};
   const starter = sample.starter || {};
   const psu = sample.psu || {};
+  const hall = sample.hall || {};
   const connected = sample.connected || state.status.connected || {};
 
   setLamp("lamp-pump", !!connected.pump);
   setLamp("lamp-starter", !!connected.starter);
   setLamp("lamp-psu", !!connected.psu);
+  setLamp("lamp-hall", !!connected.hall);
 
   $("lbl-pump-rpm-live").textContent = `${Math.round(Number(pump.rpm_mech || 0))} rpm`;
   $("lbl-starter-rpm-live").textContent = `${Math.round(Number(starter.rpm_mech || 0))} rpm`;
   $("lbl-psu-live").textContent = `${fmt(psu.v_out, 1)}V / ${fmt(psu.i_out, 1)}A`;
+  $("lbl-hall-rpm-live").textContent = `${Math.round(Number(hall.rpm || 0))} rpm`;
 
   pushPlot(sample);
+}
+
+function saveHallPairs() {
+  return api("/api/hall/pairs", "POST", {
+    value: Number($("hall-pairs").value),
+  });
 }
 
 function connectWs() {
@@ -855,6 +903,32 @@ $("btn-update").onclick = async () => {
       setError(e.message || String(e));
     }
   };
+    $("btn-hall-connect").onclick = async () => {
+      try {
+        await saveHallPairs();
+        await api("/api/hall/connect", "POST", { port: $("cb-hall").value });
+        setError("");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    };
+
+    $("btn-hall-disconnect").onclick = async () => {
+      try {
+        await api("/api/hall/disconnect");
+        setError("");
+      } catch (e) {
+        setError(e.message || String(e));
+      }
+    };
+
+    ["plot-starter-rpm", "plot-hall-rpm", "plot-starter-duty", "plot-starter-current"].forEach((id) => {
+      const el = $(id);
+      if (el) {
+        el.addEventListener("change", drawStarterChart);
+      }
+    });
+
 
   bindEnter("in-pump-duty", "btn-pump-set-duty");
   bindEnter("in-pump-rpm", "btn-pump-set-rpm");
