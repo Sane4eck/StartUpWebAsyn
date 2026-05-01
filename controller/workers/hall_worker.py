@@ -116,6 +116,7 @@ def hall_worker_main(
                     raw = ser.readline()
                     if raw:
                         line = raw.decode("utf-8", errors="ignore").strip()
+                        snap.raw_line = line
                         if line and not line.startswith("#"):
                             m = LINE_RE.search(line)
                             if m:
