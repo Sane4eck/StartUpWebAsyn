@@ -108,6 +108,8 @@ class PsuViBody(BaseModel):
 class BoolBody(BaseModel):
     value: bool
 
+class IntValueBody(BaseModel):
+    value: int
 
 def _ok(**extra):
     data = {"ok": True}
@@ -177,6 +179,20 @@ async def api_psu_connect(body: PortBody):
 @app.post("/api/psu/disconnect")
 async def api_psu_disconnect():
     return _call(runtime.cmd_disconnect_psu)
+
+@app.post("/api/hall/connect")
+async def api_hall_connect(body: PortBody):
+    return _call(runtime.cmd_connect_hall, body.port)
+
+
+@app.post("/api/hall/disconnect")
+async def api_hall_disconnect():
+    return _call(runtime.cmd_disconnect_hall)
+
+
+@app.post("/api/hall/pairs")
+async def api_hall_pairs(body: IntValueBody):
+    return _call(runtime.cmd_set_hall_pairs, body.value)
 
 
 @app.post("/api/pole-pairs")
