@@ -14,13 +14,14 @@ from controller.cycle_fsm import CycleFSM
 from controller.cyclogram_startup import build_cooling_fsm, build_startup_fsm
 from controller.pump_profile import interp_profile, load_pump_profile_xlsx
 from controller.runtime_types import (
+    HallSnapshot,
     PsuSnapshot,
     PsuTarget,
     VescSnapshot,
     VescTarget,
     make_command,
 )
-from controller.workers import logger_worker_main, psu_worker_main, vesc_worker_main
+from controller.workers import hall_worker_main, logger_worker_main, psu_worker_main, vesc_worker_main
 from scheme.cycle import CycleInputs
 from scheme.pump_profile import PumpProfile
 from scheme.startup import StartupConfig
@@ -118,6 +119,7 @@ class WebControllerRuntime:
         self._starter_proc = _ProcHandle(self._ctx, "starter", vesc_worker_main, (1/10, 0.01, 115200))
         self._psu_proc = _ProcHandle(self._ctx, "psu", psu_worker_main, (1/10, 0.5, 0.2, 115200, 0.2, 1))
         self._logger_proc = _ProcHandle(self._ctx, "logger", logger_worker_main, ("logs",))
+        self._hall_proc = _ProcHandle(self._ctx, "hall", hall_worker_main, (0.02, 0.2, 115200))
 
         self.startup_cfg = StartupConfig()
 
@@ -132,6 +134,7 @@ class WebControllerRuntime:
         self._pump_snap = VescSnapshot()
         self._starter_snap = VescSnapshot()
         self._psu_snap = PsuSnapshot()
+        self._hall_snap = HallSnapshot()
 
         self.pump_target = {"mode": "rpm", "value": 0.0}
         self.starter_target = {"mode": "duty", "value": 0.0}
@@ -169,6 +172,7 @@ class WebControllerRuntime:
         self._starter_proc.start()
         self._psu_proc.start()
         self._logger_proc.start()
+        self._hall_proc.start()
 
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -189,6 +193,7 @@ class WebControllerRuntime:
         self._starter_proc.stop()
         self._psu_proc.stop()
         self._logger_proc.stop()
+        self._hall_proc.stop()
 
     # ------------------------------------------------------------------
     # public API
@@ -235,6 +240,23 @@ class WebControllerRuntime:
 
     def cmd_disconnect_psu(self) -> None:
         self._post(self._psu_proc, "psu", "disconnect", {})
+
+    def cmd_connect_hall(self, port: str) -> None:
+        port = str(port or "").strip()
+        if not port:
+            raise ValueError("Hall COM port is empty")
+        self._post(self._hall_proc, "hall", "connect", {"port": port})
+
+    def cmd_disconnect_hall(self) -> None:
+        self._post(self._hall_proc, "hall", "disconnect", {})
+
+    def cmd_set_hall_pairs(self, pairs: int) -> None:
+        self._post(
+            self._hall_proc,
+            "hall",
+            "set_pairs",
+            {"pairs": max(1, int(pairs))},
+        )
 
     def cmd_set_pole_pairs_pump(self, pole_pairs: int) -> None:
         self._post(
@@ -563,7 +585,7 @@ class WebControllerRuntime:
     # ------------------------------------------------------------------
 
     def _drain_worker_events(self) -> None:
-        for proc in (self._pump_proc, self._starter_proc, self._psu_proc, self._logger_proc):
+        for proc in (self._pump_proc, self._starter_proc, self._psu_proc, self._hall_proc, self._logger_proc):
             for evt in proc.drain_events():
                 worker = str(evt.get("worker", ""))
                 kind = str(evt.get("kind", ""))
@@ -575,6 +597,8 @@ class WebControllerRuntime:
                     self._starter_snap = VescSnapshot(**payload)
                 elif worker == "psu" and kind == "snapshot":
                     self._psu_snap = PsuSnapshot(**payload)
+                elif worker == "hall" and kind == "snapshot":
+                    self._hall_snap = HallSnapshot(**payload)
                 elif worker == "logger" and kind == "state":
                     self._logger_path = str(payload.get("log_path", "") or "")
                     err = payload.get("error")
@@ -696,6 +720,7 @@ class WebControllerRuntime:
                 "pump": self._pump_snap.connected,
                 "starter": self._starter_snap.connected,
                 "psu": self._psu_snap.connected,
+                "hall": self._hall_snap.connected,
             },
             "log_path": self._logger_path,
             "pump_profile": {
@@ -715,10 +740,12 @@ class WebControllerRuntime:
                 "pump": self._pump_snap.connected,
                 "starter": self._starter_snap.connected,
                 "psu": self._psu_snap.connected,
+                "hall": self._hall_snap.connected,
             },
             "pump": asdict(self._pump_snap),
             "starter": asdict(self._starter_snap),
             "psu": asdict(self._psu_snap),
+            "hall": asdict(self._hall_snap),
         }
 
     def _build_log_row(self) -> dict[str, Any]:
@@ -726,6 +753,7 @@ class WebControllerRuntime:
         pump = sample["pump"]
         starter = sample["starter"]
         psu = sample["psu"]
+        hall = sample["hall"]
 
         return {
             "t": round(float(sample["t"]), 6),
@@ -741,4 +769,8 @@ class WebControllerRuntime:
             "psu_v_out": psu.get("v_out", 0.0),
             "psu_i_out": psu.get("i_out", 0.0),
             "psu_output": int(bool(psu.get("output", False))),
+            "hall_rpm": hall.get("rpm", 0.0),
+            "hall_rpm_raw": hall.get("rpm_raw", 0.0),
+            "hall_pulses": hall.get("pulses", 0),
+            "hall_sample_ms": hall.get("sample_ms", 0),
         }
