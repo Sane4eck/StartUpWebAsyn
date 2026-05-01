@@ -6,6 +6,7 @@ from typing import Any, Dict, Literal, Optional
 
 
 WorkerName = Literal["pump", "starter", "psu", "logger"]
+WorkerName = Literal["pump", "starter", "psu", "hall", "logger"]
 EventKind = Literal["snapshot", "state", "error", "ack"]
 
 
@@ -74,6 +75,21 @@ class PsuSnapshot:
     ts: float = field(default_factory=mono_ts)
     error: Optional[str] = None
     raw: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass(slots=True)
+class HallSnapshot:
+    connected: bool = False
+    port: str = ""
+    pairs: int = 1
+
+    rpm_raw: float = 0.0
+    rpm: float = 0.0
+    pulses: int = 0
+    sample_ms: int = 0
+
+    ts: float = field(default_factory=mono_ts)
+    error: Optional[str] = None
+    raw_line: str = ""
 
 
 @dataclass(slots=True)
