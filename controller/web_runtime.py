@@ -25,6 +25,11 @@ from scheme.cycle import CycleInputs
 from scheme.pump_profile import PumpProfile
 from scheme.startup import StartupConfig
 
+PUMP_PROFILE_XLSX = "_Cyclogram_Pump_v1.xlsx"
+# PUMP_PROFILE_XLSX = "_Cyclogram_Pump.xlsx"
+# PUMP_PROFILE_XLSX = "_Cyclogram_Pump_test.xlsx"
+CYCLOGRAM_DIRNAME = "file_cyclogram"
+
 
 def _clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
@@ -90,13 +95,13 @@ class WebControllerRuntime:
     def __init__(
         self,
         publish: Callable[[str, Any], None] | None = None,
-        dt: float = 0.05,
+        dt: float = 1/100,
     ):
         self.publish = publish or (lambda event, payload: None)
 
         self.dt = float(dt)
-        self.ui_hz = 5.0
-        self.log_hz = 5.0
+        self.ui_hz = 10.0
+        self.log_hz = 10.0
 
         self._ui_dt = 1.0 / self.ui_hz
         self._log_dt = 1.0 / self.log_hz
@@ -109,9 +114,9 @@ class WebControllerRuntime:
         self._thread: threading.Thread | None = None
 
         self._ctx = mp.get_context("spawn")
-        self._pump_proc = _ProcHandle(self._ctx, "pump", vesc_worker_main, (0.02, 0.01, 115200))
-        self._starter_proc = _ProcHandle(self._ctx, "starter", vesc_worker_main, (0.02, 0.01, 115200))
-        self._psu_proc = _ProcHandle(self._ctx, "psu", psu_worker_main, (0.02, 0.5, 0.2, 115200, 0.2, 1))
+        self._pump_proc = _ProcHandle(self._ctx, "pump", vesc_worker_main, (1/10, 0.01, 115200))
+        self._starter_proc = _ProcHandle(self._ctx, "starter", vesc_worker_main, (1/10, 0.01, 115200))
+        self._psu_proc = _ProcHandle(self._ctx, "psu", psu_worker_main, (1/10, 0.5, 0.2, 115200, 0.2, 1))
         self._logger_proc = _ProcHandle(self._ctx, "logger", logger_worker_main, ("logs",))
 
         self.startup_cfg = StartupConfig()
@@ -141,6 +146,8 @@ class WebControllerRuntime:
         self._pump_prof_t0 = 0.0
 
         self._run_pump_profile: PumpProfile | None = None
+        self._run_pump_profile_mtime: float | None = None
+        self._run_pump_profile_path = ""
         self._run_starter_profile: PumpProfile = PumpProfile([], [])
 
         self._valve_macro_active = False
@@ -261,6 +268,11 @@ class WebControllerRuntime:
             self.starter_target = {"mode": "duty", "value": 0.0}
             self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
 
+            try:
+                self._ensure_run_profiles()
+            except Exception as e:
+                self._emit_error(str(e))
+
         self._post(self._logger_proc, "logger", "open", {"prefix": prefix or "manual"})
         self._publish("status", {**self._build_status(), "ready": True, "reset_plot": True})
 
@@ -281,7 +293,7 @@ class WebControllerRuntime:
             self._valve_macro_active = False
 
             if self._run_pump_profile is None or not self._run_pump_profile.t:
-                raise ValueError("Спочатку завантаж pump profile (.xlsx)")
+                raise ValueError("Спочатку вибери pump profile через Browse / Start profile")
 
             now = time.monotonic()
             inp = self._make_inputs(now)
@@ -360,10 +372,13 @@ class WebControllerRuntime:
             self._fsm_prev_state = None
 
             self._pump_prof = prof
+            self._pump_prof_path = raw
+
+            # цей файл тепер буде використовуватись і для Run
             self._run_pump_profile = prof
+            self._run_pump_profile_path = raw
 
             self._pump_prof_active = True
-            self._pump_prof_path = raw
             self._pump_prof_t0 = now
             self._stage = "pump_profile"
 
@@ -523,6 +538,25 @@ class WebControllerRuntime:
             time.sleep(0.1)
         except Exception:
             pass
+
+    def _ensure_run_profiles(self) -> None:
+        project_root = Path(__file__).resolve().parent.parent
+        cyclogram_dir = project_root / CYCLOGRAM_DIRNAME
+        pump_path = cyclogram_dir / PUMP_PROFILE_XLSX
+
+        if not pump_path.exists():
+            raise ValueError(f"Run pump profile file not found: {pump_path}")
+
+        mtime = pump_path.stat().st_mtime
+
+        if self._run_pump_profile is None or self._run_pump_profile_mtime != mtime:
+            prof = load_pump_profile_xlsx(str(pump_path), sheet_name=None)
+
+            if not prof.t:
+                raise ValueError(f"Run pump profile is empty: {pump_path}")
+
+            self._run_pump_profile = prof
+            self._run_pump_profile_mtime = mtime
 
     # ------------------------------------------------------------------
     # worker event handling
