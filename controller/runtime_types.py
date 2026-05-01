@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any, Dict, Literal, Optional
 
 
-WorkerName = Literal["pump", "starter", "psu", "logger"]
 WorkerName = Literal["pump", "starter", "psu", "hall", "logger"]
 EventKind = Literal["snapshot", "state", "error", "ack"]
 
