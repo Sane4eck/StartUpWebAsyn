@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+
 from web_app import app
 
 import uvicorn
@@ -12,16 +13,18 @@ import webview
 HOST = "127.0.0.1"
 PORT = 8000
 
+# зберігаємо window поза js_api
+_MAIN_WINDOW = None
+
 
 class JsApi:
-    def __init__(self) -> None:
-        self.window = None
-
     def choose_xlsx(self) -> str:
-        if self.window is None:
+        global _MAIN_WINDOW
+
+        if _MAIN_WINDOW is None:
             return ""
 
-        result = self.window.create_file_dialog(
+        result = _MAIN_WINDOW.create_file_dialog(
             webview.OPEN_DIALOG,
             directory=str(Path.cwd()),
             allow_multiple=False,
@@ -55,5 +58,6 @@ if __name__ == "__main__":
         background_color="#06080c",
         js_api=api,
     )
-    api.window = window
+
+    _MAIN_WINDOW = window
     webview.start()
