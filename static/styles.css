@@ -78,6 +78,14 @@ body {
   border-radius: 6px;
 }
 
+.chart-toggles {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--muted);
+}
+
 .manual-panel {
   padding: 8px 10px;
 }
@@ -191,6 +199,11 @@ body {
 .live-darkred {
   color: #ff8a8a;
   min-width: 240px;
+}
+
+.live-green {
+  color: #9bff8f;
+  min-width: 170px;
 }
 
 input,
