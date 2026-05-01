@@ -24,6 +24,10 @@ HEADER = [
     "psu_v_out",
     "psu_i_out",
     "psu_output",
+    "hall_rpm",
+    "hall_rpm_raw",
+    "hall_pulses",
+    "hall_sample_ms",
 ]
 
 
