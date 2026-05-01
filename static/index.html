@@ -13,8 +13,27 @@
       <div class="plot-title-row">
         <h1>Start-up</h1>
         <div class="ws-box">
+          <div class="chart-toggles">
+            <label class="inline-check">
+              <input id="plot-starter-rpm" type="checkbox" checked />
+              <span>Starter RPM</span>
+            </label>
+            <label class="inline-check">
+              <input id="plot-hall-rpm" type="checkbox" checked />
+              <span>Hall RPM</span>
+            </label>
+            <label class="inline-check">
+              <input id="plot-starter-duty" type="checkbox" checked />
+              <span>Starter Duty</span>
+            </label>
+            <label class="inline-check">
+              <input id="plot-starter-current" type="checkbox" checked />
+              <span>Starter Current</span>
+            </label>
+          </div>
           <span id="ws-lamp" class="lamp off"></span>
           <span id="ws-text">WS: offline</span>
+
         </div>
       </div>
 
@@ -36,6 +55,25 @@
           <input id="chk-auto-ports" type="checkbox" />
           <span>Auto ports</span>
         </label>
+        <span class="toolbar-gap"></span>
+
+        <label class="inline-label fixed-label">
+          <span>Hall COM:</span>
+          <select id="cb-hall"></select>
+        </label>
+
+        <span id="lamp-hall" class="lamp off"></span>
+
+        <button id="btn-hall-connect">Connect</button>
+        <button id="btn-hall-disconnect">Disconnect</button>
+
+        <label class="inline-label">
+          <span>pairs:</span>
+          <input id="hall-pairs" class="w-60" type="number" value="1" min="1" />
+        </label>
+
+        <span class="metric-label">Hall RPM:</span>
+        <span id="lbl-hall-rpm-live" class="live-value live-green">0 rpm</span>
       </div>
 
       <div class="group-box">
