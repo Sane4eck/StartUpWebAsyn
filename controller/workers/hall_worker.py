@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import re
 import time
+from dataclasses import asdict
 
 import serial
 from serial import SerialException
@@ -53,7 +54,7 @@ def hall_worker_main(
     snap = HallSnapshot()
 
     def push_snapshot():
-        evt_q.put(make_event(name, "snapshot", snap.__dict__))
+        evt_q.put(make_event(name, "snapshot", asdict(snap)))
 
     def push_error(text: str):
         evt_q.put(make_event(name, "error", {"message": str(text)}))
