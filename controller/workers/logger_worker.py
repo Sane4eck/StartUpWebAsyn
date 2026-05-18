@@ -11,23 +11,29 @@ from controller.runtime_types import make_event
 
 
 HEADER = [
-    "t",
-    "stage",
-    "pump_rpm",
-    "pump_duty",
-    "pump_current",
-    "starter_rpm",
-    "starter_duty",
-    "starter_current",
-    "psu_v_set",
-    "psu_i_set",
-    "psu_v_out",
-    "psu_i_out",
-    "psu_output",
-    "hall_rpm",
-    "hall_rpm_raw",
-    "hall_pulses",
-    "hall_sample_ms",
+    "t", "stage",
+
+    # ---- PUMP (pmp_)
+    "pmp_rpm_cmd", "pmp_erpm_cmd", "pmp_duty_cmd",
+    "pmp_rpm_get", "pmp_erpm_get", "pmp_duty_get",
+    "pmp_current_get", "pmp_bat_current", "pmp_v_in_get",
+    "pmp_raw_amp_hours", "pmp_raw_amp_hours_charged",
+    "pmp_raw_watt_hours", "pmp_raw_watt_hours_charged",
+    "pmp_raw_temp_fet", "pmp_raw_temp_motor",
+
+    # ---- STARTER (strtr_)
+    "strtr_rpm_cmd", "strtr_erpm_cmd", "strtr_duty_cmd",
+    "strtr_rpm_get", "strtr_erpm_get", "strtr_duty_get",
+    "strtr_current_get", "strtr_bat_current", "strtr_v_in_get",
+    "strtr_raw_amp_hours", "strtr_raw_amp_hours_charged",
+    "strtr_raw_watt_hours", "strtr_raw_watt_hours_charged",
+    "strtr_raw_temp_fet", "strtr_raw_temp_motor",
+
+    # ---- PSU
+    "psu_v_set", "psu_i_set", "psu_v_out", "psu_i_out", "psu_p_out",
+
+    # ---- HALL
+    "hall_pairs", "hall_rpm", "hall_rpm_raw", "hall_pulses", "hall_sample_ms",
 ]
 
 
