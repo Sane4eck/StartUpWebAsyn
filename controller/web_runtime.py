@@ -748,29 +748,95 @@ class WebControllerRuntime:
             "hall": asdict(self._hall_snap),
         }
 
+    def _f(self, x: Any, default: float = 0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+    def _cmd_log_cols(self, target: dict[str, Any], pole_pairs: int, prefix: str) -> dict[str, Any]:
+        mode = str(target.get("mode", "duty"))
+        val = self._f(target.get("value", 0.0))
+        pp = max(1, int(pole_pairs))
+
+        out = {
+            f"{prefix}rpm_cmd": "",
+            f"{prefix}erpm_cmd": "",
+            f"{prefix}duty_cmd": "",
+        }
+
+        if mode == "rpm":
+            out[f"{prefix}rpm_cmd"] = val
+            out[f"{prefix}erpm_cmd"] = val * pp
+        else:
+            out[f"{prefix}duty_cmd"] = _clamp01(val)
+
+        return out
+
+    def _get_log_cols(self, snap: dict[str, Any], pole_pairs: int, prefix: str) -> dict[str, Any]:
+        raw = snap.get("raw", {}) or {}
+        pp = max(1, int(pole_pairs))
+
+        erpm = raw.get("rpm", None)
+        duty = raw.get("duty_cycle_now", None)
+        cur_m = raw.get("avg_motor_current", None)
+        cur_b = raw.get("avg_input_current", None)
+        v_in = raw.get("v_in", None)
+
+        rpm_mech_attr = snap.get("rpm_mech", None)
+        rpm_get = self._f(rpm_mech_attr) if rpm_mech_attr is not None else (self._f(erpm) / pp)
+
+        return {
+            f"{prefix}rpm_get": rpm_get,
+            f"{prefix}erpm_get": self._f(erpm, 0.0),
+            f"{prefix}duty_get": self._f(duty, 0.0),
+            f"{prefix}current_get": self._f(cur_m, 0.0),
+            f"{prefix}bat_current": self._f(cur_b, 0.0),
+            f"{prefix}v_in_get": self._f(v_in, 0.0),
+        }
+
+    def _raw_log_cols(self, snap: dict[str, Any], prefix: str) -> dict[str, Any]:
+        raw = snap.get("raw", {}) or {}
+        return {
+            f"{prefix}raw_amp_hours": self._f(raw.get("amp_hours", 0.0)),
+            f"{prefix}raw_amp_hours_charged": self._f(raw.get("amp_hours_charged", 0.0)),
+            f"{prefix}raw_watt_hours": self._f(raw.get("watt_hours", 0.0)),
+            f"{prefix}raw_watt_hours_charged": self._f(raw.get("watt_hours_charged", 0.0)),
+            f"{prefix}raw_temp_fet": self._f(raw.get("temp_fet", 0.0)),
+            f"{prefix}raw_temp_motor": self._f(raw.get("temp_motor", 0.0)),
+        }
+
     def _build_log_row(self) -> dict[str, Any]:
         sample = self._build_sample()
+
         pump = sample["pump"]
         starter = sample["starter"]
         psu = sample["psu"]
         hall = sample["hall"]
 
-        return {
+        row: dict[str, Any] = {
             "t": round(float(sample["t"]), 6),
             "stage": sample["stage"],
-            "pump_rpm": pump.get("rpm_mech", 0.0),
-            "pump_duty": pump.get("duty", 0.0),
-            "pump_current": pump.get("current_motor", 0.0),
-            "starter_rpm": starter.get("rpm_mech", 0.0),
-            "starter_duty": starter.get("duty", 0.0),
-            "starter_current": starter.get("current_motor", 0.0),
-            "psu_v_set": psu.get("v_set", 0.0),
-            "psu_i_set": psu.get("i_set", 0.0),
-            "psu_v_out": psu.get("v_out", 0.0),
-            "psu_i_out": psu.get("i_out", 0.0),
-            "psu_output": int(bool(psu.get("output", False))),
-            "hall_rpm": hall.get("rpm", 0.0),
-            "hall_rpm_raw": hall.get("rpm_raw", 0.0),
-            "hall_pulses": hall.get("pulses", 0),
-            "hall_sample_ms": hall.get("sample_ms", 0),
         }
+
+        row.update(self._cmd_log_cols(self.pump_target, self._pump_snap.pole_pairs, "pmp_"))
+        row.update(self._get_log_cols(pump, self._pump_snap.pole_pairs, "pmp_"))
+        row.update(self._raw_log_cols(pump, "pmp_"))
+
+        row.update(self._cmd_log_cols(self.starter_target, self._starter_snap.pole_pairs, "strtr_"))
+        row.update(self._get_log_cols(starter, self._starter_snap.pole_pairs, "strtr_"))
+        row.update(self._raw_log_cols(starter, "strtr_"))
+
+        row["psu_v_set"] = self._f(psu.get("v_set", 0.0))
+        row["psu_i_set"] = self._f(psu.get("i_set", 0.0))
+        row["psu_v_out"] = self._f(psu.get("v_out", 0.0))
+        row["psu_i_out"] = self._f(psu.get("i_out", 0.0))
+        row["psu_p_out"] = self._f(psu.get("p_out", 0.0))
+
+        row["hall_pairs"] = int(hall.get("pairs", 1) or 1)
+        row["hall_rpm"] = self._f(hall.get("rpm", 0.0))
+        row["hall_rpm_raw"] = self._f(hall.get("rpm_raw", 0.0))
+        row["hall_pulses"] = int(hall.get("pulses", 0) or 0)
+        row["hall_sample_ms"] = int(hall.get("sample_ms", 0) or 0)
+
+        return row
