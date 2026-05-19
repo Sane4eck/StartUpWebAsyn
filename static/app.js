@@ -507,12 +507,16 @@ function normalizeStage(stage) {
     "cooling": "cooling",
     "Cooling": "cooling",
 
+    "spooldown": "spooldown",
+    "SpoolDown": "spooldown",
+
     "stop": "stop",
     "Stop": "stop",
 
     "PumpProfile": "pumpprofile",
     "pump_profile": "pumpprofile",
     "pumpprofile": "pumpprofile",
+
   };
 
   return map[s] || (s ? s.toLowerCase() : "-");
@@ -676,6 +680,7 @@ function bind() {
     try {
       await api("/api/ready", "POST", { prefix: "manual" });
       setError("");
+      setActive(["btn-run", "btn-cooling", "btn-spool-down"], null);
     } catch (e) {
       setError(e.message || String(e));
     }
@@ -691,6 +696,7 @@ $("btn-update").onclick = async () => {
     fillPorts(parsePorts({ ports: snap.ports || [] }));
     updateStatus({ ...(snap.status || {}), reset_plot: true });
     updateSample(snap.sample || {});
+    setActive(["btn-run", "btn-cooling", "btn-spool-down"], null);
 
     if (snap.last_error) {
       setError(String(snap.last_error));
@@ -705,7 +711,7 @@ $("btn-update").onclick = async () => {
   $("btn-run").onclick = async () => {
     try {
       await api("/api/run-cycle");
-      setActive(["btn-run"], "btn-run");
+      setActive(["btn-run", "btn-cooling", "btn-spool-down"], "btn-run");
       setError("");
     } catch (e) {
       setError(e.message || String(e));
@@ -715,9 +721,29 @@ $("btn-update").onclick = async () => {
   $("btn-stop-all").onclick = async () => {
     try {
       await api("/api/stop-all");
-      setActive(["btn-run"], null);
+      setActive(["btn-run", "btn-cooling", "btn-spool-down"], null);
       setActive(["btn-pump-set-duty", "btn-pump-set-rpm", "btn-pump-stop"], "btn-pump-stop");
       setActive(["btn-starter-set-duty", "btn-starter-set-rpm", "btn-starter-stop"], "btn-starter-stop");
+      setError("");
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+  };
+
+    $("btn-cooling").onclick = async () => {
+    try {
+      await api("/api/cooling-hold");
+      setActive(["btn-run", "btn-cooling", "btn-spool-down"], "btn-cooling");
+      setError("");
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+  };
+
+  $("btn-spool-down").onclick = async () => {
+    try {
+      await api("/api/spool-down");
+      setActive(["btn-run", "btn-cooling", "btn-spool-down"], "btn-spool-down");
       setError("");
     } catch (e) {
       setError(e.message || String(e));
