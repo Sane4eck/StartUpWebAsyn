@@ -42,3 +42,8 @@ class StartupConfig:
     valve_boost_s: float = 2.0
     valve_hold_v: float = 5.0
     valve_hold_i: float = 20.0
+
+    # --- Cooling / Spool down
+    cooling_duty: float = 0.15
+    stopup_idle_rpm: float = 1000.0
+    stopup_pump_step_rpm: float = 150.0
