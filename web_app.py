@@ -279,6 +279,14 @@ async def api_psu_vi(body: PsuViBody):
 async def api_psu_output(body: BoolBody):
     return _call(runtime.cmd_psu_output, body.value)
 
+@app.post("/api/cooling-hold")
+async def api_cooling_hold():
+    return _call(runtime.cmd_start_cooling_hold)
+
+
+@app.post("/api/spool-down")
+async def api_spool_down():
+    return _call(runtime.cmd_start_stopup)
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
