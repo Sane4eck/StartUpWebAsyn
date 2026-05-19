@@ -156,6 +156,9 @@ class WebControllerRuntime:
         self._valve_macro_active = False
         self._valve_macro_t0 = 0.0
 
+        self._cooling_hold_active = False
+        self._stopup_active = False
+
         self._seq = 0
 
     # ------------------------------------------------------------------
@@ -281,6 +284,7 @@ class WebControllerRuntime:
             self._fsm_prev_state = None
             self._stop_pump_profile_internal()
             self._valve_macro_active = False
+            self._clear_special_modes()
 
             self._t0 = now
             self._stage = "ready"
@@ -306,6 +310,7 @@ class WebControllerRuntime:
             self._fsm_prev_state = None
             self._stop_pump_profile_internal()
             self._valve_macro_active = False
+            self._clear_special_modes()
             self._stage = "idle"
         self._publish("status", {**self._build_status(), "reset_plot": True})
 
@@ -313,6 +318,7 @@ class WebControllerRuntime:
         with self._lock:
             self._stop_pump_profile_internal()
             self._valve_macro_active = False
+            self._clear_special_modes()
 
             if self._run_pump_profile is None or not self._run_pump_profile.t:
                 raise ValueError("Спочатку вибери pump profile через Browse / Start profile")
@@ -333,6 +339,7 @@ class WebControllerRuntime:
         with self._lock:
             self._stop_pump_profile_internal()
             self._valve_macro_active = False
+            self._clear_special_modes()
 
             now = time.monotonic()
             inp = self._make_inputs(now)
@@ -342,12 +349,39 @@ class WebControllerRuntime:
             self._fsm.start(inp)
             self._stage = _stage_public_name(self._fsm.state)
 
+    def cmd_start_cooling_hold(self) -> None:
+        with self._lock:
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+            self._clear_special_modes()
+
+            self._cooling_hold_active = True
+            self._stage = "cooling"
+
+            self.pump_target = {"mode": "rpm", "value": 0.0}
+            self.starter_target = {"mode": "duty", "value": _clamp01(self.startup_cfg.cooling_duty)}
+            self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+
+    def cmd_start_stopup(self) -> None:
+        with self._lock:
+            self._fsm = None
+            self._fsm_prev_state = None
+            self._stop_pump_profile_internal()
+            self._valve_macro_active = False
+            self._clear_special_modes()
+
+            self._stopup_active = True
+            self._stage = "spooldown"
+
     def cmd_stop_all(self) -> None:
         with self._lock:
             self._fsm = None
             self._fsm_prev_state = None
             self._stop_pump_profile_internal()
             self._valve_macro_active = False
+            self._clear_special_modes()
             self._stage = "stop"
 
             self.pump_target = {"mode": "rpm", "value": 0.0}
@@ -366,6 +400,7 @@ class WebControllerRuntime:
             self._fsm = None
             self._fsm_prev_state = None
             self._stop_pump_profile_internal()
+            self._clear_special_modes()
 
             self._valve_macro_active = True
             self._valve_macro_t0 = time.monotonic()
@@ -374,6 +409,7 @@ class WebControllerRuntime:
     def cmd_valve_off(self) -> None:
         with self._lock:
             self._valve_macro_active = False
+            self._clear_special_modes()
             self._stage = "manual"
             self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
 
@@ -392,6 +428,7 @@ class WebControllerRuntime:
         with self._lock:
             self._fsm = None
             self._fsm_prev_state = None
+            self._clear_special_modes()
 
             self._pump_prof = prof
             self._pump_prof_path = raw
@@ -414,6 +451,7 @@ class WebControllerRuntime:
     def cmd_set_pump_rpm(self, value: float) -> None:
         with self._lock:
             self._stop_pump_profile_internal()
+            self._clear_special_modes()
 
             if self._fsm is not None and self._fsm.state == "Running":
                 self.pump_target = {"mode": "rpm", "value": float(value)}
@@ -427,6 +465,7 @@ class WebControllerRuntime:
     def cmd_set_pump_duty(self, value: float) -> None:
         with self._lock:
             self._stop_pump_profile_internal()
+            self._clear_special_modes()
 
             if self._fsm is not None and self._fsm.state == "Running":
                 self.pump_target = {"mode": "duty", "value": _clamp01(value)}
@@ -440,6 +479,7 @@ class WebControllerRuntime:
     def cmd_set_starter_rpm(self, value: float) -> None:
         with self._lock:
             self._stop_pump_profile_internal()
+            self._clear_special_modes()
             self._fsm = None
             self._fsm_prev_state = None
             self._stage = "manual"
@@ -448,6 +488,7 @@ class WebControllerRuntime:
     def cmd_set_starter_duty(self, value: float) -> None:
         with self._lock:
             self._stop_pump_profile_internal()
+            self._clear_special_modes()
             self._fsm = None
             self._fsm_prev_state = None
             self._stage = "manual"
@@ -459,6 +500,7 @@ class WebControllerRuntime:
             self._fsm = None
             self._fsm_prev_state = None
             self._valve_macro_active = False
+            self._clear_special_modes()
             self._stage = "manual"
             self.psu_target = {
                 "v": float(v),
@@ -472,12 +514,17 @@ class WebControllerRuntime:
             self._fsm = None
             self._fsm_prev_state = None
             self._valve_macro_active = False
+            self._clear_special_modes()
             self._stage = "manual"
             self.psu_target = {
                 "v": float(self.psu_target.get("v", 0.0)),
                 "i": float(self.psu_target.get("i", 0.0)),
                 "out": bool(value),
             }
+
+    def _clear_special_modes(self) -> None:
+        self._cooling_hold_active = False
+        self._stopup_active = False
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -651,8 +698,71 @@ class WebControllerRuntime:
 
         with self._lock:
             self._check_stale(now)
+            if self._stopup_active:
+                engine_rpm = float(self._hall_snap.rpm) if self._hall_snap.connected else float(self._starter_snap.rpm_mech)
+                idle_rpm = float(self.startup_cfg.stopup_idle_rpm)
+
+                if engine_rpm > idle_rpm:
+                    pump_measured = max(0.0, float(self._pump_snap.rpm_mech))
+
+                    if str(self.pump_target.get("mode", "rpm")) == "rpm":
+                        pump_base = max(pump_measured, float(self.pump_target.get("value", 0.0)))
+                    else:
+                        pump_base = pump_measured
+
+                    next_pump_rpm = max(0.0, pump_base - float(self.startup_cfg.stopup_pump_step_rpm))
+
+                    self.pump_target = {"mode": "rpm", "value": next_pump_rpm}
+                    self.starter_target = {"mode": "duty", "value": 0.0}
+                    self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                    self._stage = "spooldown"
+                else:
+                    self._stopup_active = False
+                    self._cooling_hold_active = True
+                    self.pump_target = {"mode": "rpm", "value": 0.0}
+                    self.starter_target = {"mode": "duty", "value": _clamp01(self.startup_cfg.cooling_duty)}
+                    self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                    self._stage = "cooling"
+
+            elif self._cooling_hold_active:
+                self.pump_target = {"mode": "rpm", "value": 0.0}
+                self.starter_target = {"mode": "duty", "value": _clamp01(self.startup_cfg.cooling_duty)}
+                self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                self._stage = "cooling"
 
             if self._fsm is None and self._pump_prof_active and self._pump_prof is not None:
+                if self._stopup_active:
+                    engine_rpm = float(self._hall_snap.rpm) if self._hall_snap.connected else float(
+                        self._starter_snap.rpm_mech)
+                    idle_rpm = float(self.startup_cfg.stopup_idle_rpm)
+
+                    if engine_rpm > idle_rpm:
+                        pump_measured = max(0.0, float(self._pump_snap.rpm_mech))
+
+                        if str(self.pump_target.get("mode", "rpm")) == "rpm":
+                            pump_base = max(pump_measured, float(self.pump_target.get("value", 0.0)))
+                        else:
+                            pump_base = pump_measured
+
+                        next_pump_rpm = max(0.0, pump_base - float(self.startup_cfg.stopup_pump_step_rpm))
+
+                        self.pump_target = {"mode": "rpm", "value": next_pump_rpm}
+                        self.starter_target = {"mode": "duty", "value": 0.0}
+                        self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                        self._stage = "spooldown"
+                    else:
+                        self._stopup_active = False
+                        self._cooling_hold_active = True
+                        self.pump_target = {"mode": "rpm", "value": 0.0}
+                        self.starter_target = {"mode": "duty", "value": _clamp01(self.startup_cfg.cooling_duty)}
+                        self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                        self._stage = "cooling"
+
+                elif self._cooling_hold_active:
+                    self.pump_target = {"mode": "rpm", "value": 0.0}
+                    self.starter_target = {"mode": "duty", "value": _clamp01(self.startup_cfg.cooling_duty)}
+                    self.psu_target = {"v": 0.0, "i": 0.0, "out": False}
+                    self._stage = "cooling"
                 elapsed = now - self._pump_prof_t0
                 end_t = self._pump_prof.end_time
 
